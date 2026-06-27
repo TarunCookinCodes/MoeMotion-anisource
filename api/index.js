@@ -34,20 +34,37 @@ app.get("/search", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing ?q parameter" })
 
   try {
-    const url = `${ANINEKO_BASE}/search.html?keyword=${encodeURIComponent(query)}`
+    const url = `${ANINEKO_BASE}/browser?keyword=${encodeURIComponent(query)}`
     const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 9000 })
     const $ = cheerio.load(html)
     const results = []
+    const seen = new Set()
 
-    $(".items li, ul.items > li, .last_episodes li").each((_, el) => {
+    // Find all <a> tags pointing to /watch/{slug} — these are anime cards
+    $("a[href*='/watch/']").each((_, el) => {
       const $el = $(el)
-      const a = $el.find("a").first()
-      const href = a.attr("href") || ""
-      const title = a.attr("title") || $el.find(".name a, p.name a").text().trim()
-      const img = $el.find("img").attr("src") || ""
-      const slugMatch = href.match(/\/category\/([^/?]+)/) || href.match(/\/([^/?]+)$/)
-      const slug = slugMatch ? slugMatch[1] : null
-      if (slug && title) results.push({ slug, title, image: img })
+      const href = $el.attr("href") || ""
+
+      // Extract slug from /watch/{slug} or /watch/{slug}/ep-N
+      const match = href.match(/\/watch\/([^/?#]+)/)
+      if (!match) return
+      const slug = match[1]
+      if (seen.has(slug)) return
+      seen.add(slug)
+
+      // Try multiple ways to get the title
+      const title =
+        $el.attr("title") ||
+        $el.find("img").attr("alt") ||
+        $el.find(".name, .title, h3, h4").text().trim() ||
+        $el.text().trim().slice(0, 100) ||
+        slug.replace(/-/g, " ")
+
+      const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
+
+      if (slug && title) {
+        results.push({ slug, title, image: img })
+      }
     })
 
     res.json({ results })
@@ -91,7 +108,7 @@ app.get("/scrape", async (req, res) => {
             serverName: getServerName(cleanUrl),
             embedUrl: cleanUrl,
             m3u8,
-            proxiedM3u8: `/api/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
+            proxiedM3u8: `/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
           }
         } catch (err) {
           console.warn(`[scrape] Failed ${embedUrl}:`, err.message)
@@ -224,5 +241,4 @@ function getServerName(url) {
   }
 }
 
-// Vercel handler
 export default app
