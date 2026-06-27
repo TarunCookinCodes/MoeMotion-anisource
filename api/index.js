@@ -16,10 +16,14 @@ const COMMON_HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
 }
 
+// PUBLIC base URL where this scraper is hosted (so we can rewrite proxy URLs)
+const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || "https://anineko-scraper.vercel.app"
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "AniNeko Scraper",
+    publicBase: PUBLIC_BASE,
     endpoints: [
       "GET /search?q=naruto",
       "GET /scrape?slug=one-piece&ep=1",
@@ -40,19 +44,15 @@ app.get("/search", async (req, res) => {
     const results = []
     const seen = new Set()
 
-    // Find all <a> tags pointing to /watch/{slug} — these are anime cards
     $("a[href*='/watch/']").each((_, el) => {
       const $el = $(el)
       const href = $el.attr("href") || ""
-
-      // Extract slug from /watch/{slug} or /watch/{slug}/ep-N
       const match = href.match(/\/watch\/([^/?#]+)/)
       if (!match) return
       const slug = match[1]
       if (seen.has(slug)) return
       seen.add(slug)
 
-      // Try multiple ways to get the title
       const title =
         $el.attr("title") ||
         $el.find("img").attr("alt") ||
@@ -108,7 +108,8 @@ app.get("/scrape", async (req, res) => {
             serverName: getServerName(cleanUrl),
             embedUrl: cleanUrl,
             m3u8,
-            proxiedM3u8: `/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
+            // FULL absolute URL so client doesn't have to know our base
+            proxiedM3u8: `${PUBLIC_BASE}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
           }
         } catch (err) {
           console.warn(`[scrape] Failed ${embedUrl}:`, err.message)
@@ -133,6 +134,7 @@ app.get("/scrape", async (req, res) => {
   }
 })
 
+// PROXY for master.m3u8 and quality variant playlists
 app.get("/proxy", async (req, res) => {
   const url = req.query.url
   const ref = req.query.ref || "https://vivibebe.site/"
@@ -146,15 +148,31 @@ app.get("/proxy", async (req, res) => {
     })
 
     let body = upstream.data
+    // Base URL of the FETCHED file (so relative paths resolve)
     const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
-    body = body.replace(/^(?!#)(.+\.m3u8.*?)$/gm, (line) => {
-      const absoluteUrl = line.startsWith("http") ? line : baseUrl + line
-      return `/api/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
-    })
-    body = body.replace(/^(?!#)(.+\.ts.*?)$/gm, (line) => {
-      const absoluteUrl = line.startsWith("http") ? line : baseUrl + line
-      return `/api/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
-    })
+
+    // Rewrite each line of the m3u8 playlist
+    body = body
+      .split("\n")
+      .map((line) => {
+        const trimmed = line.trim()
+        // Skip comments/empty lines
+        if (!trimmed || trimmed.startsWith("#")) return line
+
+        // It's a URL — make it absolute
+        const absoluteUrl = trimmed.startsWith("http")
+          ? trimmed
+          : new URL(trimmed, baseUrl).href
+
+        // Route to appropriate proxy endpoint based on extension
+        if (absoluteUrl.includes(".m3u8")) {
+          return `${PUBLIC_BASE}/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+        } else {
+          // Assume .ts segment or anything else
+          return `${PUBLIC_BASE}/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+        }
+      })
+      .join("\n")
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl")
     res.setHeader("Access-Control-Allow-Origin", "*")
