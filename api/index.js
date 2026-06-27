@@ -4,7 +4,6 @@ import * as cheerio from "cheerio"
 import cors from "cors"
 
 const app = express()
-const PORT = process.env.PORT || 8000
 
 app.use(cors({ origin: "*" }))
 
@@ -36,7 +35,7 @@ app.get("/search", async (req, res) => {
 
   try {
     const url = `${ANINEKO_BASE}/search.html?keyword=${encodeURIComponent(query)}`
-    const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 15000 })
+    const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 9000 })
     const $ = cheerio.load(html)
     const results = []
 
@@ -64,9 +63,8 @@ app.get("/scrape", async (req, res) => {
 
   try {
     const epUrl = `${ANINEKO_BASE}/watch/${slug}/ep-${ep}`
-    const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 15000 })
+    const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
 
-    // Find ALL data-video attributes (these are the actual server embed URLs)
     const dataVideoMatches = html.match(/data-video=["']([^"']+)["']/gi) || []
     const embedUrls = dataVideoMatches
       .map((m) => {
@@ -81,11 +79,9 @@ app.get("/scrape", async (req, res) => {
 
     console.log(`[scrape] Found ${embedUrls.length} embed servers for ${slug}/ep-${ep}`)
 
-    // Try to extract m3u8 from each embed in parallel
     const results = await Promise.all(
       embedUrls.map(async (embedUrl) => {
         try {
-          // Strip the ?sub= or ?caption_1= query param for the actual embed fetch
           const cleanUrl = embedUrl.split("?")[0]
           const m3u8 = await extractM3u8FromEmbed(cleanUrl)
           if (!m3u8) return null
@@ -95,7 +91,7 @@ app.get("/scrape", async (req, res) => {
             serverName: getServerName(cleanUrl),
             embedUrl: cleanUrl,
             m3u8,
-            proxiedM3u8: `/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
+            proxiedM3u8: `/api/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
           }
         } catch (err) {
           console.warn(`[scrape] Failed ${embedUrl}:`, err.message)
@@ -129,18 +125,18 @@ app.get("/proxy", async (req, res) => {
     const upstream = await axios.get(url, {
       headers: { ...COMMON_HEADERS, Referer: ref, Origin: ref.replace(/\/$/, "") },
       responseType: "text",
-      timeout: 15000,
+      timeout: 9000,
     })
 
     let body = upstream.data
     const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
     body = body.replace(/^(?!#)(.+\.m3u8.*?)$/gm, (line) => {
       const absoluteUrl = line.startsWith("http") ? line : baseUrl + line
-      return `/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+      return `/api/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
     })
     body = body.replace(/^(?!#)(.+\.ts.*?)$/gm, (line) => {
       const absoluteUrl = line.startsWith("http") ? line : baseUrl + line
-      return `/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+      return `/api/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
     })
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl")
@@ -162,7 +158,7 @@ app.get("/segment", async (req, res) => {
     const upstream = await axios.get(url, {
       headers: { ...COMMON_HEADERS, Referer: ref, Origin: ref.replace(/\/$/, "") },
       responseType: "stream",
-      timeout: 30000,
+      timeout: 9000,
     })
 
     res.setHeader("Content-Type", "video/mp2t")
@@ -178,22 +174,18 @@ app.get("/segment", async (req, res) => {
 async function extractM3u8FromEmbed(iframeUrl) {
   const { data: html } = await axios.get(iframeUrl, {
     headers: { ...COMMON_HEADERS, Referer: `${ANINEKO_BASE}/` },
-    timeout: 15000,
+    timeout: 9000,
   })
 
-  // Strategy 1: master.m3u8
   const m3u8Master = html.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
   if (m3u8Master) return m3u8Master[0]
 
-  // Strategy 2: any .m3u8
   const m3u8Generic = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
   if (m3u8Generic) return m3u8Generic[0]
 
-  // Strategy 3: file: "..." or source: "..."
   const sourceMatch = html.match(/(?:file|source|src)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
   if (sourceMatch) return sourceMatch[1]
 
-  // Strategy 4: base64 decoded
   const base64Matches = html.match(/[A-Za-z0-9+/]{40,}={0,2}/g) || []
   for (const b64 of base64Matches) {
     try {
@@ -221,7 +213,6 @@ function getServerName(url) {
   try {
     const u = new URL(url)
     const host = u.hostname.replace(/^www\./, "")
-    // Friendly names
     if (host.includes("vivibebe")) return "VibePlayer"
     if (host.includes("bibiemb")) return "BibiEmb"
     if (host.includes("otakuhg")) return "OtakuHG"
@@ -233,6 +224,5 @@ function getServerName(url) {
   }
 }
 
-app.listen(PORT, () => {
-  console.log(`🚀 AniNeko Scraper running on port ${PORT}`)
-})
+// Vercel handler
+export default app
