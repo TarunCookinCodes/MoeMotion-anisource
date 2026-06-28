@@ -259,4 +259,64 @@ function getServerName(url) {
   }
 }
 
+// DEBUG: Returns the raw HTML so we can see what's actually on the page
+app.get("/debug-html", async (req, res) => {
+  const { slug, ep } = req.query
+  if (!slug || !ep) return res.status(400).json({ error: "Missing slug or ep" })
+
+  try {
+    const epUrl = `${ANINEKO_BASE}/watch/${slug}/ep-${ep}`
+    const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
+
+    // Find all data-* attributes that look like video sources
+    const dataVideoMatches = html.match(/data-video=["']([^"']+)["']/gi) || []
+    const dataSrcMatches = html.match(/data-src=["']([^"']+)["']/gi) || []
+    const dataEmbedMatches = html.match(/data-embed=["']([^"']+)["']/gi) || []
+    const dataIdMatches = html.match(/data-id=["']([^"']+)["']/gi) || []
+    const dataServerMatches = html.match(/data-server=["']([^"']+)["']/gi) || []
+
+    // Find anything that looks like a CDN URL
+    const cdnHints = html.match(/https?:\/\/[a-z0-9-]+\.(?:site|xyz|workers\.dev|com|net)\/[a-z0-9]+/gi) || []
+
+    // Find server containers
+    const serverContainers = html.match(/<(?:div|ul|li)[^>]*(?:server|episode|player)[^>]*>/gi) || []
+
+    res.json({
+      url: epUrl,
+      htmlLength: html.length,
+      dataVideo: {
+        count: dataVideoMatches.length,
+        samples: dataVideoMatches.slice(0, 10),
+      },
+      dataSrc: {
+        count: dataSrcMatches.length,
+        samples: dataSrcMatches.slice(0, 10),
+      },
+      dataEmbed: {
+        count: dataEmbedMatches.length,
+        samples: dataEmbedMatches.slice(0, 10),
+      },
+      dataId: {
+        count: dataIdMatches.length,
+        samples: dataIdMatches.slice(0, 10),
+      },
+      dataServer: {
+        count: dataServerMatches.length,
+        samples: dataServerMatches.slice(0, 10),
+      },
+      cdnHints: {
+        count: cdnHints.length,
+        samples: [...new Set(cdnHints)].slice(0, 20),
+      },
+      serverContainers: serverContainers.slice(0, 5),
+      firstChars: html.substring(0, 500),
+      // Search for the word "DUB" in context
+      dubContext: (html.match(/.{200}DUB.{200}/i) || [])[0]?.substring(0, 600) || "no DUB mention found",
+      subContext: (html.match(/.{200}SUB.{200}/i) || [])[0]?.substring(0, 600) || "no SUB mention found",
+    })
+  } catch (err) {
+    res.status(500).json({ error: String(err) })
+  }
+})
+
 export default app
