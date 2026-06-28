@@ -16,7 +16,6 @@ const COMMON_HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
 }
 
-// PUBLIC base URL where this scraper is hosted (so we can rewrite proxy URLs)
 const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || "https://anineko-scraper.vercel.app"
 
 app.get("/", (req, res) => {
@@ -26,9 +25,13 @@ app.get("/", (req, res) => {
     publicBase: PUBLIC_BASE,
     endpoints: [
       "GET /search?q=naruto",
-      "GET /scrape?slug=one-piece&ep=1",
+      "GET /scrape?slug=one-piece&ep=1               (returns all sources grouped by audio)",
+      "GET /scrape?slug=one-piece&ep=1&type=sub      (only sub sources)",
+      "GET /scrape?slug=one-piece&ep=1&type=dub      (only dub sources)",
+      "GET /scrape?slug=one-piece&ep=1&type=hsub     (only hardsub sources)",
       "GET /proxy?url=ENCODED_M3U8_URL",
       "GET /segment?url=ENCODED_SEGMENT_URL",
+      "GET /debug-html?slug=one-piece&ep=1",
     ],
   })
 })
@@ -74,45 +77,114 @@ app.get("/search", async (req, res) => {
   }
 })
 
+/**
+ * Group data-video URLs by their audio type (hsub/sub/dub) using a heuristic:
+ *   - Find positions of all data-id="hsub|sub|dub" markers in the raw HTML
+ *   - For each data-video, find which audio marker is the CLOSEST preceding one
+ *   - That marker's audio type becomes that video's group
+ *
+ * Why this works: AniNeko renders audio tabs as <li data-id="sub"> followed by
+ * their server <li data-video="..."> entries. So every video URL appears AFTER
+ * an audio marker but BEFORE the next audio marker.
+ */
+function groupVideosByAudio(html) {
+  const groups = { hsub: [], sub: [], dub: [] }
+
+  // Find positions of all audio-type markers
+  const markerPositions = []
+  const markerRegex = /data-id=["'](hsub|sub|dub)["']/gi
+  let m
+  while ((m = markerRegex.exec(html)) !== null) {
+    markerPositions.push({ pos: m.index, type: m[1].toLowerCase() })
+  }
+
+  // Find all data-video entries with their positions
+  const videoRegex = /data-video=["']([^"']+)["']/gi
+  let v
+  while ((v = videoRegex.exec(html)) !== null) {
+    const url = v[1]
+    const pos = v.index
+
+    // Find the closest preceding marker
+    let bestType = null
+    for (let i = markerPositions.length - 1; i >= 0; i--) {
+      if (markerPositions[i].pos < pos) {
+        bestType = markerPositions[i].type
+        break
+      }
+    }
+
+    if (bestType && groups[bestType]) {
+      // Dedupe by clean URL (strip query params)
+      const cleanUrl = url.split("?")[0]
+      if (!groups[bestType].some((u) => u.split("?")[0] === cleanUrl)) {
+        groups[bestType].push(url)
+      }
+    }
+  }
+
+  return groups
+}
+
 app.get("/scrape", async (req, res) => {
-  const { slug, ep } = req.query
+  const { slug, ep, type } = req.query
   if (!slug || !ep) return res.status(400).json({ error: "Missing slug or ep parameter" })
+
+  const requestedType = type && ["sub", "dub", "hsub"].includes(type.toLowerCase())
+    ? type.toLowerCase()
+    : null
 
   try {
     const epUrl = `${ANINEKO_BASE}/watch/${slug}/ep-${ep}`
     const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
 
-    const dataVideoMatches = html.match(/data-video=["']([^"']+)["']/gi) || []
-    const embedUrls = dataVideoMatches
-      .map((m) => {
-        const match = m.match(/data-video=["']([^"']+)["']/i)
-        return match ? match[1] : null
-      })
-      .filter(Boolean)
+    const grouped = groupVideosByAudio(html)
+    const totalFound =
+      grouped.hsub.length + grouped.sub.length + grouped.dub.length
 
-    if (embedUrls.length === 0) {
-      return res.status(404).json({ error: "No video servers found", url: epUrl })
+    if (totalFound === 0) {
+      return res.status(404).json({
+        error: "No video servers found",
+        url: epUrl,
+      })
     }
 
-    console.log(`[scrape] Found ${embedUrls.length} embed servers for ${slug}/ep-${ep}`)
+    console.log(
+      `[scrape] ${slug}/ep-${ep} — hsub:${grouped.hsub.length} sub:${grouped.sub.length} dub:${grouped.dub.length}`,
+    )
 
+    // Decide which embeds to process
+    let toProcess = []
+    if (requestedType) {
+      toProcess = grouped[requestedType].map((url) => ({ url, audio: requestedType }))
+    } else {
+      // All types
+      for (const audio of ["hsub", "sub", "dub"]) {
+        for (const url of grouped[audio]) {
+          toProcess.push({ url, audio })
+        }
+      }
+    }
+
+    // Extract m3u8 from each in parallel
     const results = await Promise.all(
-      embedUrls.map(async (embedUrl) => {
+      toProcess.map(async ({ url, audio }) => {
         try {
-          const cleanUrl = embedUrl.split("?")[0]
+          const cleanUrl = url.split("?")[0]
           const m3u8 = await extractM3u8FromEmbed(cleanUrl)
           if (!m3u8) return null
 
           const origin = getOrigin(cleanUrl)
           return {
             serverName: getServerName(cleanUrl),
+            audio,
             embedUrl: cleanUrl,
+            originalEmbedUrl: url,
             m3u8,
-            // FULL absolute URL so client doesn't have to know our base
             proxiedM3u8: `${PUBLIC_BASE}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
           }
         } catch (err) {
-          console.warn(`[scrape] Failed ${embedUrl}:`, err.message)
+          console.warn(`[scrape] Failed ${url}:`, err.message)
           return null
         }
       }),
@@ -123,18 +195,38 @@ app.get("/scrape", async (req, res) => {
     if (sources.length === 0) {
       return res.status(500).json({
         error: "No m3u8 extracted from any embed",
-        embedsFound: embedUrls,
+        groupedCounts: {
+          hsub: grouped.hsub.length,
+          sub: grouped.sub.length,
+          dub: grouped.dub.length,
+        },
       })
     }
 
-    res.json({ sources, total: sources.length, attempted: embedUrls.length })
+    // Build per-audio source lists for easy client consumption
+    const byAudio = {
+      hsub: sources.filter((s) => s.audio === "hsub"),
+      sub: sources.filter((s) => s.audio === "sub"),
+      dub: sources.filter((s) => s.audio === "dub"),
+    }
+
+    res.json({
+      sources,
+      byAudio,
+      counts: {
+        hsub: byAudio.hsub.length,
+        sub: byAudio.sub.length,
+        dub: byAudio.dub.length,
+        total: sources.length,
+      },
+      attempted: toProcess.length,
+    })
   } catch (err) {
     console.error("[/scrape]", err.message)
     res.status(500).json({ error: "Scrape failed", details: err.message })
   }
 })
 
-// PROXY for master.m3u8 and quality variant playlists
 app.get("/proxy", async (req, res) => {
   const url = req.query.url
   const ref = req.query.ref || "https://vivibebe.site/"
@@ -148,27 +240,21 @@ app.get("/proxy", async (req, res) => {
     })
 
     let body = upstream.data
-    // Base URL of the FETCHED file (so relative paths resolve)
     const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
 
-    // Rewrite each line of the m3u8 playlist
     body = body
       .split("\n")
       .map((line) => {
         const trimmed = line.trim()
-        // Skip comments/empty lines
         if (!trimmed || trimmed.startsWith("#")) return line
 
-        // It's a URL — make it absolute
         const absoluteUrl = trimmed.startsWith("http")
           ? trimmed
           : new URL(trimmed, baseUrl).href
 
-        // Route to appropriate proxy endpoint based on extension
         if (absoluteUrl.includes(".m3u8")) {
           return `${PUBLIC_BASE}/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
         } else {
-          // Assume .ts segment or anything else
           return `${PUBLIC_BASE}/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
         }
       })
@@ -259,7 +345,6 @@ function getServerName(url) {
   }
 }
 
-// DEBUG: Returns the raw HTML so we can see what's actually on the page
 app.get("/debug-html", async (req, res) => {
   const { slug, ep } = req.query
   if (!slug || !ep) return res.status(400).json({ error: "Missing slug or ep" })
@@ -268,51 +353,16 @@ app.get("/debug-html", async (req, res) => {
     const epUrl = `${ANINEKO_BASE}/watch/${slug}/ep-${ep}`
     const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
 
-    // Find all data-* attributes that look like video sources
-    const dataVideoMatches = html.match(/data-video=["']([^"']+)["']/gi) || []
-    const dataSrcMatches = html.match(/data-src=["']([^"']+)["']/gi) || []
-    const dataEmbedMatches = html.match(/data-embed=["']([^"']+)["']/gi) || []
-    const dataIdMatches = html.match(/data-id=["']([^"']+)["']/gi) || []
-    const dataServerMatches = html.match(/data-server=["']([^"']+)["']/gi) || []
-
-    // Find anything that looks like a CDN URL
-    const cdnHints = html.match(/https?:\/\/[a-z0-9-]+\.(?:site|xyz|workers\.dev|com|net)\/[a-z0-9]+/gi) || []
-
-    // Find server containers
-    const serverContainers = html.match(/<(?:div|ul|li)[^>]*(?:server|episode|player)[^>]*>/gi) || []
+    const grouped = groupVideosByAudio(html)
 
     res.json({
       url: epUrl,
       htmlLength: html.length,
-      dataVideo: {
-        count: dataVideoMatches.length,
-        samples: dataVideoMatches.slice(0, 10),
+      grouped: {
+        hsub: { count: grouped.hsub.length, samples: grouped.hsub.slice(0, 5) },
+        sub: { count: grouped.sub.length, samples: grouped.sub.slice(0, 5) },
+        dub: { count: grouped.dub.length, samples: grouped.dub.slice(0, 5) },
       },
-      dataSrc: {
-        count: dataSrcMatches.length,
-        samples: dataSrcMatches.slice(0, 10),
-      },
-      dataEmbed: {
-        count: dataEmbedMatches.length,
-        samples: dataEmbedMatches.slice(0, 10),
-      },
-      dataId: {
-        count: dataIdMatches.length,
-        samples: dataIdMatches.slice(0, 10),
-      },
-      dataServer: {
-        count: dataServerMatches.length,
-        samples: dataServerMatches.slice(0, 10),
-      },
-      cdnHints: {
-        count: cdnHints.length,
-        samples: [...new Set(cdnHints)].slice(0, 20),
-      },
-      serverContainers: serverContainers.slice(0, 5),
-      firstChars: html.substring(0, 500),
-      // Search for the word "DUB" in context
-      dubContext: (html.match(/.{200}DUB.{200}/i) || [])[0]?.substring(0, 600) || "no DUB mention found",
-      subContext: (html.match(/.{200}SUB.{200}/i) || [])[0]?.substring(0, 600) || "no SUB mention found",
     })
   } catch (err) {
     res.status(500).json({ error: String(err) })
