@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Anineko HLS Extractor</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121a33;
+      --text: #e6ecff;
+      --muted: #9fb0e0;
+      --accent: #6aa2ff;
+      --ok: #37d67a;
+      --err: #ff6b6b;
+      --border: #2a3a6b;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, sans-serif;
+      background: radial-gradient(1200px 800px at 20% -10%, #1b2b59 0%, transparent 60%), var(--bg);
+      color: var(--text);
+      min-height: 100svh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    .card {
+      width: min(960px, 100%);
+      background: color-mix(in oklab, var(--panel) 92%, black 8%);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 10px 40px rgba(0,0,0,.35);
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(1.4rem, 2.2vw, 1.9rem);
+    }
+
+    p.sub {
+      margin: 0 0 16px;
+      color: var(--muted);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+    }
+
+    input[type="url"] {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #0d1530;
+      color: var(--text);
+      outline: none;
+    }
+
+    input[type="url"]:focus { border-color: var(--accent); }
+
+    button {
+      border: 1px solid var(--border);
+      background: #15306d;
+      color: #fff;
+      border-radius: 10px;
+      padding: 12px 14px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    button:hover { filter: brightness(1.08); }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+
+    .small {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: .92rem;
+      line-height: 1.4;
+    }
+
+    .status {
+      margin-top: 14px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #0d1530;
+      white-space: pre-wrap;
+      color: var(--muted);
+    }
+
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+
+    .results {
+      margin-top: 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      background: #0b1229;
+    }
+
+    .results-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      background: #0e1735;
+      color: var(--muted);
+      font-size: .92rem;
+    }
+
+    pre {
+      margin: 0;
+      padding: 12px;
+      max-height: 320px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
+    }
+
+    a.inline { color: var(--accent); }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Anineko HLS Extractor</h1>
+    <p class="sub">Paste an <strong>anineko</strong> page URL and try to extract <code>.m3u8</code> stream links.</p>
+
+    <div class="row">
+      <input id="pageUrl" type="url" placeholder="https://..." autocomplete="off" />
+      <button id="extractBtn">Extract HLS</button>
+    </div>
+
+    <p class="small">
+      Note: Many streaming sites block browser-side scraping (CORS / anti-bot / obfuscation). If extraction fails in browser,
+      run extraction server-side (API/proxy) and call that endpoint from this page.
+    </p>
+
+    <div id="status" class="status">Ready.</div>
+
+    <section class="results">
+      <div class="results-head">
+        <span>Extracted links</span>
+        <button id="copyBtn" disabled>Copy all</button>
+      </div>
+      <pre id="output" class="muted">No links yet.</pre>
+    </section>
+  </main>
+
+  <script>
+    const pageUrlEl = document.getElementById('pageUrl');
+    const extractBtn = document.getElementById('extractBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const outputEl = document.getElementById('output');
+    const statusEl = document.getElementById('status');
+
+    let links = [];
+
+    function setStatus(msg, type = '') {
+      statusEl.className = 'status' + (type ? ' ' + type : '');
+      statusEl.textContent = msg;
+    }
+
+    function setLinks(next) {
+      links = Array.from(new Set(next));
+      if (!links.length) {
+        outputEl.textContent = 'No links found.';
+        outputEl.className = 'muted';
+        copyBtn.disabled = true;
+        return;
+      }
+      outputEl.textContent = links.join('\n');
+      outputEl.className = '';
+      copyBtn.disabled = false;
+    }
+
+    function findM3u8(text) {
+      const regex = /https?:\\/\\/[^\"'\\s)<>]+\\.m3u8(?:\\?[^\"'\\s)<>]*)?/gi;
+      return text.match(regex) || [];
+    }
+
+    async function extractFromHtml(url) {
+      const res = await fetch(url, { method: 'GET', mode: 'cors' });
+      if (!res.ok) throw new Error('Request failed: ' + res.status + ' ' + res.statusText);
+      const html = await res.text();
+      return findM3u8(html);
+    }
+
+    async function onExtract() {
+      const raw = pageUrlEl.value.trim();
+      if (!raw) {
+        setStatus('Please enter a URL first.', 'err');
+        return;
+      }
+
+      let url;
+      try {
+        url = new URL(raw);
+      } catch {
+        setStatus('Invalid URL format.', 'err');
+        return;
+      }
+
+      if (!/anineko/i.test(url.hostname)) {
+        setStatus('Warning: URL host does not look like anineko. Continuing anyway...');
+      } else {
+        setStatus('Fetching page and scanning for .m3u8 links...');
+      }
+
+      extractBtn.disabled = true;
+      setLinks([]);
+
+      try {
+        const found = await extractFromHtml(url.href);
+        setLinks(found);
+        if (found.length) {
+          setStatus('Done. Found ' + found.length + ' unique .m3u8 link(s).', 'ok');
+        } else {
+          setStatus('No .m3u8 links found in page HTML. The stream may be loaded dynamically or blocked by CORS.', 'err');
+        }
+      } catch (err) {
+        setStatus(
+          'Extraction failed in browser. This is often due to CORS / anti-bot protections.\\n' +
+          'Error: ' + (err?.message || String(err)) + '\\n' +
+          'Tip: Add a backend endpoint (proxy/scraper) and call it from this page.',
+          'err'
+        );
+      } finally {
+        extractBtn.disabled = false;
+      }
+    }
+
+    extractBtn.addEventListener('click', onExtract);
+    pageUrlEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') onExtract();
+    });
+
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(links.join('\n'));
+        setStatus('Copied ' + links.length + ' link(s) to clipboard.', 'ok');
+      } catch {
+        setStatus('Could not copy to clipboard. Try selecting text manually.', 'err');
+      }
+    });
+  </script>
+</body>
+</html>
