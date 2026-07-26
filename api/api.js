@@ -17,7 +17,7 @@ const COMMON_HEADERS = {
   "Accept-Language": "en-US,en;q=0.9",
 }
 
-const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || "https://anineko-scraper.vercel.app"
+const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || ""
 
 app.get("/", (req, res) => {
   res.json({
@@ -172,13 +172,14 @@ app.get("/scrape", async (req, res) => {
           if (!m3u8) return null
           const cleanUrl = url.split("?")[0]
           const origin = getOrigin(cleanUrl)
+          const base = PUBLIC_BASE || `https://${req.get('host')}`
           return {
             serverName: getServerName(cleanUrl),
             audio,
             embedUrl: cleanUrl,
             originalEmbedUrl: url,
             m3u8,
-            proxiedM3u8: `${PUBLIC_BASE}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
+            proxiedM3u8: `${base}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
           }
         } catch (err) {
           return null
@@ -234,7 +235,8 @@ app.get("/proxy", async (req, res) => {
     })
 
     let body = upstream.data
-    const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
+        const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
+    const base = PUBLIC_BASE || `https://${req.get('host')}`
 
     body = body
       .split("\n")
@@ -243,9 +245,9 @@ app.get("/proxy", async (req, res) => {
         if (!trimmed || trimmed.startsWith("#")) return line
         const absoluteUrl = trimmed.startsWith("http") ? trimmed : new URL(trimmed, baseUrl).href
         if (absoluteUrl.includes(".m3u8")) {
-          return `${PUBLIC_BASE}/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+          return `${base}/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
         } else {
-          return `${PUBLIC_BASE}/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+          return `${base}/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
         }
       })
       .join("\n")
@@ -340,5 +342,5 @@ app.get("/debug-html", async (req, res) => {
   }
 })
 
-export const handler = serverless(app)
-export default app
+const handler = serverless(app)
+export { handler }
