@@ -58,7 +58,11 @@ app.get("/search", async (req, res) => {
       if (seen.has(slug)) return
       seen.add(slug)
 
-      const title = $el.find(".name, .title, h3, h4").text().trim() || $link.text().trim()
+      let title = $el.find(".name, .title, h3, h4").text().trim() || $link.text().trim()
+      // Clean up title from common AniNeko noise
+      title = title.split("\n")[0].trim()
+      title = title.replace(/\s+(TV|Movie|Special|OVA|ONA)\s*$/i, "").trim()
+      title = title.replace(/\s+CC\s+\d+.*$/i, "").trim()
       const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
 
       if (slug && title) {
@@ -76,12 +80,16 @@ app.get("/search", async (req, res) => {
         if (seen.has(slug)) return
         seen.add(slug)
 
-        const title =
+        let title =
           $el.find(".name, .title, h3, h4").text().trim() ||
           $el.attr("title") ||
           $el.find("img").attr("alt") ||
           $el.text().trim().slice(0, 100) ||
           slug.replace(/-/g, " ")
+        
+        title = title.split("\n")[0].trim()
+        title = title.replace(/\s+(TV|Movie|Special|OVA|ONA)\s*$/i, "").trim()
+        title = title.replace(/\s+CC\s+\d+.*$/i, "").trim()
 
         const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
 
