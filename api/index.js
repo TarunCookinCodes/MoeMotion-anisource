@@ -2,6 +2,7 @@ import express from "express"
 import axios from "axios"
 import * as cheerio from "cheerio"
 import cors from "cors"
+import serverless from "serverless-http"
 
 const app = express()
 
@@ -47,7 +48,6 @@ app.get("/search", async (req, res) => {
     const results = []
     const seen = new Set()
 
-    // Improved selector to target the actual anime cards
     $(".nv-anime-card").each((_, el) => {
       const $el = $(el)
       const $link = $el.find("a[href*='/watch/']").first()
@@ -66,7 +66,6 @@ app.get("/search", async (req, res) => {
       }
     })
 
-    // Fallback to old method if no results found with new selector
     if (results.length === 0) {
       $("a[href*='/watch/']").each((_, el) => {
         const $el = $(el)
@@ -99,19 +98,10 @@ app.get("/search", async (req, res) => {
   }
 })
 
-/**
- * Group data-video URLs by their audio type (hsub/sub/dub) using a heuristic:
- *   - Find positions of all data-id="hsub|sub|dub|softsub" markers in the raw HTML
- *   - For each data-video, find which audio marker is the CLOSEST preceding one
- *   - That marker's audio type becomes that video's group
- */
 function groupVideosByAudio(html) {
   const groups = { hsub: [], sub: [], dub: [] }
-
-  // Find positions of all audio-type markers
-  const markerPositions = []
-  // Added softsub as an alias for sub
   const markerRegex = /data-id=["'](hsub|sub|dub|softsub)["']/gi
+  const markerPositions = []
   let m
   while ((m = markerRegex.exec(html)) !== null) {
     let type = m[1].toLowerCase()
@@ -119,14 +109,11 @@ function groupVideosByAudio(html) {
     markerPositions.push({ pos: m.index, type: type })
   }
 
-  // Find all data-video entries with their positions
   const videoRegex = /data-video=["']([^"']+)["']/gi
   let v
   while ((v = videoRegex.exec(html)) !== null) {
     const url = v[1]
     const pos = v.index
-
-    // Find the closest preceding marker
     let bestType = null
     for (let i = markerPositions.length - 1; i >= 0; i--) {
       if (markerPositions[i].pos < pos) {
@@ -134,16 +121,13 @@ function groupVideosByAudio(html) {
         break
       }
     }
-
     if (bestType && groups[bestType]) {
-      // Dedupe by clean URL (strip query params)
       const cleanUrl = url.split("?")[0]
       if (!groups[bestType].some((u) => u.split("?")[0] === cleanUrl)) {
         groups[bestType].push(url)
       }
     }
   }
-
   return groups
 }
 
@@ -170,16 +154,10 @@ app.get("/scrape", async (req, res) => {
       })
     }
 
-    console.log(
-      `[scrape] ${slug}/ep-${ep} — hsub:${grouped.hsub.length} sub:${grouped.sub.length} dub:${grouped.dub.length}`,
-    )
-
-    // Decide which embeds to process
     let toProcess = []
     if (requestedType) {
       toProcess = grouped[requestedType].map((url) => ({ url, audio: requestedType }))
     } else {
-      // All types
       for (const audio of ["hsub", "sub", "dub"]) {
         for (const url of grouped[audio]) {
           toProcess.push({ url, audio })
@@ -187,15 +165,11 @@ app.get("/scrape", async (req, res) => {
       }
     }
 
-    // Extract m3u8 from each in parallel
     const results = await Promise.all(
       toProcess.map(async ({ url, audio }) => {
         try {
-          // Keep the full URL for extraction as some might need query params (though currently stripped)
-          // But use the clean URL for display/consistency if needed
           const m3u8 = await extractM3u8FromEmbed(url)
           if (!m3u8) return null
-
           const cleanUrl = url.split("?")[0]
           const origin = getOrigin(cleanUrl)
           return {
@@ -207,7 +181,6 @@ app.get("/scrape", async (req, res) => {
             proxiedM3u8: `${PUBLIC_BASE}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
           }
         } catch (err) {
-          console.warn(`[scrape] Failed ${url}:`, err.message)
           return null
         }
       }),
@@ -226,7 +199,6 @@ app.get("/scrape", async (req, res) => {
       })
     }
 
-    // Build per-audio source lists for easy client consumption
     const byAudio = {
       hsub: sources.filter((s) => s.audio === "hsub"),
       sub: sources.filter((s) => s.audio === "sub"),
@@ -245,7 +217,6 @@ app.get("/scrape", async (req, res) => {
       attempted: toProcess.length,
     })
   } catch (err) {
-    console.error("[/scrape]", err.message)
     res.status(500).json({ error: "Scrape failed", details: err.message })
   }
 })
@@ -270,11 +241,7 @@ app.get("/proxy", async (req, res) => {
       .map((line) => {
         const trimmed = line.trim()
         if (!trimmed || trimmed.startsWith("#")) return line
-
-        const absoluteUrl = trimmed.startsWith("http")
-          ? trimmed
-          : new URL(trimmed, baseUrl).href
-
+        const absoluteUrl = trimmed.startsWith("http") ? trimmed : new URL(trimmed, baseUrl).href
         if (absoluteUrl.includes(".m3u8")) {
           return `${PUBLIC_BASE}/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
         } else {
@@ -288,7 +255,6 @@ app.get("/proxy", async (req, res) => {
     res.setHeader("Cache-Control", "no-cache")
     res.send(body)
   } catch (err) {
-    console.error("[/proxy]", err.message)
     res.status(502).send("Proxy failed: " + err.message)
   }
 })
@@ -304,13 +270,11 @@ app.get("/segment", async (req, res) => {
       responseType: "stream",
       timeout: 9000,
     })
-
     res.setHeader("Content-Type", "video/mp2t")
     res.setHeader("Access-Control-Allow-Origin", "*")
     res.setHeader("Cache-Control", "public, max-age=3600")
     upstream.data.pipe(res)
   } catch (err) {
-    console.error("[/segment]", err.message)
     res.status(502).send("Segment failed: " + err.message)
   }
 })
@@ -321,33 +285,13 @@ async function extractM3u8FromEmbed(iframeUrl) {
       headers: { ...COMMON_HEADERS, Referer: `${ANINEKO_BASE}/` },
       timeout: 9000,
     })
-
-    // Priority 1: Direct master.m3u8 or .m3u8 in scripts/strings
     const m3u8Master = html.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
     if (m3u8Master) return m3u8Master[0]
-
     const m3u8Generic = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
     if (m3u8Generic) return m3u8Generic[0]
-
-    // Priority 2: Standard video source tags
     const sourceMatch = html.match(/(?:file|source|src)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
     if (sourceMatch) return sourceMatch[1]
-
-    // Priority 3: Base64 encoded URLs
-    const base64Matches = html.match(/[A-Za-z0-9+/]{40,}={0,2}/g) || []
-    for (const b64 of base64Matches) {
-      try {
-        const decoded = Buffer.from(b64, "base64").toString("utf-8")
-        if (decoded.includes(".m3u8")) {
-          const found = decoded.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
-          if (found) return found[0]
-        }
-      } catch {}
-    }
-  } catch (err) {
-    console.warn(`[extractM3u8] Error fetching ${iframeUrl}:`, err.message)
-  }
-
+  } catch (err) {}
   return null
 }
 
@@ -378,13 +322,10 @@ function getServerName(url) {
 app.get("/debug-html", async (req, res) => {
   const { slug, ep } = req.query
   if (!slug || !ep) return res.status(400).json({ error: "Missing slug or ep" })
-
   try {
     const epUrl = `${ANINEKO_BASE}/watch/${slug}/ep-${ep}`
     const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
-
     const grouped = groupVideosByAudio(html)
-
     res.json({
       url: epUrl,
       htmlLength: html.length,
@@ -399,4 +340,5 @@ app.get("/debug-html", async (req, res) => {
   }
 })
 
+export const handler = serverless(app)
 export default app
