@@ -47,28 +47,50 @@ app.get("/search", async (req, res) => {
     const results = []
     const seen = new Set()
 
-    $("a[href*='/watch/']").each((_, el) => {
+    // Improved selector to target the actual anime cards
+    $(".nv-anime-card").each((_, el) => {
       const $el = $(el)
-      const href = $el.attr("href") || ""
+      const $link = $el.find("a[href*='/watch/']").first()
+      const href = $link.attr("href") || ""
       const match = href.match(/\/watch\/([^/?#]+)/)
       if (!match) return
       const slug = match[1]
       if (seen.has(slug)) return
       seen.add(slug)
 
-      const title =
-        $el.attr("title") ||
-        $el.find("img").attr("alt") ||
-        $el.find(".name, .title, h3, h4").text().trim() ||
-        $el.text().trim().slice(0, 100) ||
-        slug.replace(/-/g, " ")
-
+      const title = $el.find(".name, .title, h3, h4").text().trim() || $link.text().trim()
       const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
 
       if (slug && title) {
         results.push({ slug, title, image: img })
       }
     })
+
+    // Fallback to old method if no results found with new selector
+    if (results.length === 0) {
+      $("a[href*='/watch/']").each((_, el) => {
+        const $el = $(el)
+        const href = $el.attr("href") || ""
+        const match = href.match(/\/watch\/([^/?#]+)/)
+        if (!match) return
+        const slug = match[1]
+        if (seen.has(slug)) return
+        seen.add(slug)
+
+        const title =
+          $el.find(".name, .title, h3, h4").text().trim() ||
+          $el.attr("title") ||
+          $el.find("img").attr("alt") ||
+          $el.text().trim().slice(0, 100) ||
+          slug.replace(/-/g, " ")
+
+        const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
+
+        if (slug && title && title.length < 200) {
+          results.push({ slug, title, image: img })
+        }
+      })
+    }
 
     res.json({ results })
   } catch (err) {
@@ -79,23 +101,22 @@ app.get("/search", async (req, res) => {
 
 /**
  * Group data-video URLs by their audio type (hsub/sub/dub) using a heuristic:
- *   - Find positions of all data-id="hsub|sub|dub" markers in the raw HTML
+ *   - Find positions of all data-id="hsub|sub|dub|softsub" markers in the raw HTML
  *   - For each data-video, find which audio marker is the CLOSEST preceding one
  *   - That marker's audio type becomes that video's group
- *
- * Why this works: AniNeko renders audio tabs as <li data-id="sub"> followed by
- * their server <li data-video="..."> entries. So every video URL appears AFTER
- * an audio marker but BEFORE the next audio marker.
  */
 function groupVideosByAudio(html) {
   const groups = { hsub: [], sub: [], dub: [] }
 
   // Find positions of all audio-type markers
   const markerPositions = []
-  const markerRegex = /data-id=["'](hsub|sub|dub)["']/gi
+  // Added softsub as an alias for sub
+  const markerRegex = /data-id=["'](hsub|sub|dub|softsub)["']/gi
   let m
   while ((m = markerRegex.exec(html)) !== null) {
-    markerPositions.push({ pos: m.index, type: m[1].toLowerCase() })
+    let type = m[1].toLowerCase()
+    if (type === "softsub") type = "sub"
+    markerPositions.push({ pos: m.index, type: type })
   }
 
   // Find all data-video entries with their positions
@@ -170,10 +191,12 @@ app.get("/scrape", async (req, res) => {
     const results = await Promise.all(
       toProcess.map(async ({ url, audio }) => {
         try {
-          const cleanUrl = url.split("?")[0]
-          const m3u8 = await extractM3u8FromEmbed(cleanUrl)
+          // Keep the full URL for extraction as some might need query params (though currently stripped)
+          // But use the clean URL for display/consistency if needed
+          const m3u8 = await extractM3u8FromEmbed(url)
           if (!m3u8) return null
 
+          const cleanUrl = url.split("?")[0]
           const origin = getOrigin(cleanUrl)
           return {
             serverName: getServerName(cleanUrl),
@@ -293,29 +316,36 @@ app.get("/segment", async (req, res) => {
 })
 
 async function extractM3u8FromEmbed(iframeUrl) {
-  const { data: html } = await axios.get(iframeUrl, {
-    headers: { ...COMMON_HEADERS, Referer: `${ANINEKO_BASE}/` },
-    timeout: 9000,
-  })
+  try {
+    const { data: html } = await axios.get(iframeUrl, {
+      headers: { ...COMMON_HEADERS, Referer: `${ANINEKO_BASE}/` },
+      timeout: 9000,
+    })
 
-  const m3u8Master = html.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
-  if (m3u8Master) return m3u8Master[0]
+    // Priority 1: Direct master.m3u8 or .m3u8 in scripts/strings
+    const m3u8Master = html.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
+    if (m3u8Master) return m3u8Master[0]
 
-  const m3u8Generic = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
-  if (m3u8Generic) return m3u8Generic[0]
+    const m3u8Generic = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
+    if (m3u8Generic) return m3u8Generic[0]
 
-  const sourceMatch = html.match(/(?:file|source|src)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
-  if (sourceMatch) return sourceMatch[1]
+    // Priority 2: Standard video source tags
+    const sourceMatch = html.match(/(?:file|source|src)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
+    if (sourceMatch) return sourceMatch[1]
 
-  const base64Matches = html.match(/[A-Za-z0-9+/]{40,}={0,2}/g) || []
-  for (const b64 of base64Matches) {
-    try {
-      const decoded = Buffer.from(b64, "base64").toString("utf-8")
-      if (decoded.includes(".m3u8")) {
-        const found = decoded.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
-        if (found) return found[0]
-      }
-    } catch {}
+    // Priority 3: Base64 encoded URLs
+    const base64Matches = html.match(/[A-Za-z0-9+/]{40,}={0,2}/g) || []
+    for (const b64 of base64Matches) {
+      try {
+        const decoded = Buffer.from(b64, "base64").toString("utf-8")
+        if (decoded.includes(".m3u8")) {
+          const found = decoded.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
+          if (found) return found[0]
+        }
+      } catch {}
+    }
+  } catch (err) {
+    console.warn(`[extractM3u8] Error fetching ${iframeUrl}:`, err.message)
   }
 
   return null
