@@ -100,6 +100,8 @@ app.get("/search", async (req, res) => {
 
 function groupVideosByAudio(html) {
   const groups = { hsub: [], sub: [], dub: [] }
+  
+  // 1. Identify all audio markers
   const markerRegex = /data-id=["'](hsub|sub|dub|softsub)["']/gi
   const markerPositions = []
   let m
@@ -109,25 +111,42 @@ function groupVideosByAudio(html) {
     markerPositions.push({ pos: m.index, type: type })
   }
 
+  // 2. Identify all video entries
   const videoRegex = /data-video=["']([^"']+)["']/gi
+  const videoEntries = []
   let v
   while ((v = videoRegex.exec(html)) !== null) {
-    const url = v[1]
-    const pos = v.index
-    let bestType = null
-    for (let i = markerPositions.length - 1; i >= 0; i--) {
-      if (markerPositions[i].pos < pos) {
-        bestType = markerPositions[i].type
-        break
+    videoEntries.push({ url: v[1], pos: v.index })
+  }
+
+  // 3. Heuristic: If markers exist, group by preceding marker
+  if (markerPositions.length > 0) {
+    for (const entry of videoEntries) {
+      let bestType = null
+      for (let i = markerPositions.length - 1; i >= 0; i--) {
+        if (markerPositions[i].pos < entry.pos) {
+          bestType = markerPositions[i].type
+          break
+        }
+      }
+      if (bestType && groups[bestType]) {
+        const cleanUrl = entry.url.split("?")[0]
+        if (!groups[bestType].some((u) => u.split("?")[0] === cleanUrl)) {
+          groups[bestType].push(entry.url)
+        }
       }
     }
-    if (bestType && groups[bestType]) {
-      const cleanUrl = url.split("?")[0]
-      if (!groups[bestType].some((u) => u.split("?")[0] === cleanUrl)) {
-        groups[bestType].push(url)
+  } 
+  // 4. Fallback: If no markers found but videos exist, put them in 'hsub' as default
+  else if (videoEntries.length > 0) {
+    for (const entry of videoEntries) {
+      const cleanUrl = entry.url.split("?")[0]
+      if (!groups.hsub.some((u) => u.split("?")[0] === cleanUrl)) {
+        groups.hsub.push(entry.url)
       }
     }
   }
+
   return groups
 }
 
@@ -287,13 +306,34 @@ async function extractM3u8FromEmbed(iframeUrl) {
       headers: { ...COMMON_HEADERS, Referer: `${ANINEKO_BASE}/` },
       timeout: 9000,
     })
+
+    // Priority 1: Direct master.m3u8
     const m3u8Master = html.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
     if (m3u8Master) return m3u8Master[0]
+
+    // Priority 2: Standard .m3u8
     const m3u8Generic = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
     if (m3u8Generic) return m3u8Generic[0]
-    const sourceMatch = html.match(/(?:file|source|src)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
+
+    // Priority 3: Player source definitions
+    const sourceMatch = html.match(/(?:file|source|src|link)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
     if (sourceMatch) return sourceMatch[1]
-  } catch (err) {}
+
+    // Priority 4: Base64 encoded URLs
+    const b64Regex = /[A-Za-z0-9+/]{40,}={0,2}/g
+    const matches = html.match(b64Regex) || []
+    for (const b64 of matches) {
+      try {
+        const decoded = Buffer.from(b64, 'base64').toString('utf-8')
+        if (decoded.includes('.m3u8')) {
+          const found = decoded.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
+          if (found) return found[0]
+        }
+      } catch (e) {}
+    }
+  } catch (err) {
+    console.error(`[extractM3u8] Error for ${iframeUrl}:`, err.message)
+  }
   return null
 }
 
