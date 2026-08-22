@@ -49,6 +49,7 @@ function getServerName(url) {
     const u = new URL(url)
     const host = u.hostname.replace(/^www\./, "").toLowerCase()
     if (host.includes("vivibebe")) return "VibePlayer"
+    if (host.includes("vibevibe") || host.includes("workers.dev")) return "VibeWorker"
     if (host.includes("bibiemb")) return "BibiEmb"
     if (host.includes("otakuhg")) return "OtakuHG"
     if (host.includes("otakuvid")) return "OtakuVid"
@@ -66,6 +67,11 @@ function getServerName(url) {
 async function extractM3u8FromEmbed(iframeUrl) {
   try {
     const targetUrl = iframeUrl.trim()
+    // If target itself is already an m3u8 stream
+    if (targetUrl.includes(".m3u8")) {
+      return targetUrl
+    }
+
     const { data: html } = await axios.get(targetUrl, {
       headers: {
         ...COMMON_HEADERS,
@@ -76,19 +82,19 @@ async function extractM3u8FromEmbed(iframeUrl) {
 
     const text = typeof html === "string" ? html : JSON.stringify(html)
 
-    // Direct master.m3u8 pattern
+    // Match Cloudflare worker / vibevibe / direct master.m3u8 URLs
     const m3u8Master = text.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
     if (m3u8Master) return m3u8Master[0]
 
-    // Standard .m3u8 pattern
+    // Match generic .m3u8 URLs (like /index.m3u8 or 360p/index.m3u8)
     const m3u8Generic = text.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
     if (m3u8Generic) return m3u8Generic[0]
 
-    // JSON file/source configs
+    // Match player source JS objects
     const sourceMatch = text.match(/(?:file|source|src|link)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
     if (sourceMatch) return sourceMatch[1]
 
-    // Base64 encoded M3U8 string lookup
+    // Base64 encoded stream lookup
     const b64Regex = /[A-Za-z0-9+/]{40,}={0,2}/g
     const matches = text.match(b64Regex) || []
     for (const b64 of matches) {
@@ -122,6 +128,13 @@ function groupVideosByAudio(html) {
   let v
   while ((v = videoRegex.exec(html)) !== null) {
     videoEntries.push({ url: v[1], pos: v.index })
+  }
+
+  // Also collect any direct m3u8 links if embedded in html
+  const directM3u8Regex = /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi
+  let directMatch
+  while ((directMatch = directM3u8Regex.exec(html)) !== null) {
+    videoEntries.push({ url: directMatch[0], pos: directMatch.index })
   }
 
   if (markerPositions.length > 0) {
@@ -159,13 +172,13 @@ app.get("/", (req, res) => {
     service: "HLS Streams Scraper & Proxy",
     publicBase: base,
     endpoints: {
-      search: "GET /search?q=naruto",
-      scrape: "GET /scrape?slug=one-piece&ep=1[&type=sub|dub|hsub]",
-      extract: "GET /extract?url=ENCODED_EMBED_URL",
+      search: "GET /search?q=classroom-of-the-elite",
+      scrape: "GET /scrape?slug=classroom-of-the-elite-iv&ep=1[&type=sub|dub|hsub]",
+      extract: "GET /extract?url=ENCODED_EMBED_OR_M3U8_URL",
       proxyM3u8: "GET /proxy?url=ENCODED_M3U8_URL&ref=ENCODED_REFERER",
       proxySegment: "GET /segment?url=ENCODED_SEGMENT_URL&ref=ENCODED_REFERER",
       proxyKey: "GET /key?url=ENCODED_KEY_URL&ref=ENCODED_REFERER",
-      debug: "GET /debug-html?slug=one-piece&ep=1",
+      debug: "GET /debug-html?slug=classroom-of-the-elite-iv&ep=1",
     },
   })
 })
