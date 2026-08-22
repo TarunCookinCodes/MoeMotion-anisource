@@ -7,119 +7,116 @@ import serverless from "serverless-http"
 const app = express()
 
 app.use(cors({ origin: "*" }))
+app.use(express.json())
 
-const ANINEKO_BASE = "https://anineko.to"
+const ANINEKO_BASE = process.env.ANINEKO_BASE || "https://anineko.to"
 const COMMON_HEADERS = {
   "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
   Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
 }
 
 const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || ""
 
-app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "AniNeko Scraper",
-    publicBase: PUBLIC_BASE,
-    endpoints: [
-      "GET /search?q=naruto",
-      "GET /scrape?slug=one-piece&ep=1               (returns all sources grouped by audio)",
-      "GET /scrape?slug=one-piece&ep=1&type=sub      (only sub sources)",
-      "GET /scrape?slug=one-piece&ep=1&type=dub      (only dub sources)",
-      "GET /scrape?slug=one-piece&ep=1&type=hsub     (only hardsub sources)",
-      "GET /proxy?url=ENCODED_M3U8_URL",
-      "GET /segment?url=ENCODED_SEGMENT_URL",
-      "GET /debug-html?slug=one-piece&ep=1",
-    ],
-  })
-})
+function getBaseUrl(req) {
+  if (PUBLIC_BASE) return PUBLIC_BASE.replace(/\/$/, "")
+  const host = req.get("host") || "localhost:3000"
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http"
+  return `${proto}://${host}`
+}
 
-app.get("/search", async (req, res) => {
-  const query = req.query.q
-  if (!query) return res.status(400).json({ error: "Missing ?q parameter" })
-
+function normalizeUrl(url, base) {
   try {
-    const url = `${ANINEKO_BASE}/browser?keyword=${encodeURIComponent(query)}`
-    const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 9000 })
-    const $ = cheerio.load(html)
-    const results = []
-    const seen = new Set()
+    return new URL(url, base).href
+  } catch {
+    return url
+  }
+}
 
-    $(".nv-anime-card").each((_, el) => {
-      const $el = $(el)
-      const $link = $el.find("a[href*='/watch/']").first()
-      const href = $link.attr("href") || ""
-      const match = href.match(/\/watch\/([^/?#]+)/)
-      if (!match) return
-      const slug = match[1]
-      if (seen.has(slug)) return
-      seen.add(slug)
+function getOrigin(url) {
+  try {
+    const u = new URL(url)
+    return `${u.protocol}//${u.hostname}/`
+  } catch {
+    return "https://vivibebe.site/"
+  }
+}
 
-      let title = $el.find(".name, .title, h3, h4").text().trim() || $link.text().trim()
-      // Clean up title from common AniNeko noise
-      title = title.split("\n")[0].trim()
-      title = title.replace(/\s+(TV|Movie|Special|OVA|ONA)\s*$/i, "").trim()
-      title = title.replace(/\s+CC\s+\d+.*$/i, "").trim()
-      const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
+function getServerName(url) {
+  try {
+    const u = new URL(url)
+    const host = u.hostname.replace(/^www\./, "").toLowerCase()
+    if (host.includes("vivibebe")) return "VibePlayer"
+    if (host.includes("bibiemb")) return "BibiEmb"
+    if (host.includes("otakuhg")) return "OtakuHG"
+    if (host.includes("otakuvid")) return "OtakuVid"
+    if (host.includes("playmogo")) return "PlayMogo"
+    if (host.includes("megacloud")) return "MegaCloud"
+    if (host.includes("rapid-cloud")) return "RapidCloud"
+    if (host.includes("streamtape")) return "Streamtape"
+    if (host.includes("mp4upload")) return "Mp4Upload"
+    return host.split(".")[0]
+  } catch {
+    return "Unknown"
+  }
+}
 
-      if (slug && title) {
-        results.push({ slug, title, image: img })
-      }
+async function extractM3u8FromEmbed(iframeUrl) {
+  try {
+    const targetUrl = iframeUrl.trim()
+    const { data: html } = await axios.get(targetUrl, {
+      headers: {
+        ...COMMON_HEADERS,
+        Referer: `${ANINEKO_BASE}/`,
+      },
+      timeout: 9000,
     })
 
-    if (results.length === 0) {
-      $("a[href*='/watch/']").each((_, el) => {
-        const $el = $(el)
-        const href = $el.attr("href") || ""
-        const match = href.match(/\/watch\/([^/?#]+)/)
-        if (!match) return
-        const slug = match[1]
-        if (seen.has(slug)) return
-        seen.add(slug)
+    const text = typeof html === "string" ? html : JSON.stringify(html)
 
-        let title =
-          $el.find(".name, .title, h3, h4").text().trim() ||
-          $el.attr("title") ||
-          $el.find("img").attr("alt") ||
-          $el.text().trim().slice(0, 100) ||
-          slug.replace(/-/g, " ")
-        
-        title = title.split("\n")[0].trim()
-        title = title.replace(/\s+(TV|Movie|Special|OVA|ONA)\s*$/i, "").trim()
-        title = title.replace(/\s+CC\s+\d+.*$/i, "").trim()
+    // Direct master.m3u8 pattern
+    const m3u8Master = text.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
+    if (m3u8Master) return m3u8Master[0]
 
-        const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
+    // Standard .m3u8 pattern
+    const m3u8Generic = text.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
+    if (m3u8Generic) return m3u8Generic[0]
 
-        if (slug && title && title.length < 200) {
-          results.push({ slug, title, image: img })
+    // JSON file/source configs
+    const sourceMatch = text.match(/(?:file|source|src|link)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
+    if (sourceMatch) return sourceMatch[1]
+
+    // Base64 encoded M3U8 string lookup
+    const b64Regex = /[A-Za-z0-9+/]{40,}={0,2}/g
+    const matches = text.match(b64Regex) || []
+    for (const b64 of matches) {
+      try {
+        const decoded = Buffer.from(b64, "base64").toString("utf-8")
+        if (decoded.includes(".m3u8")) {
+          const found = decoded.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
+          if (found) return found[0]
         }
-      })
+      } catch {}
     }
-
-    res.json({ results })
   } catch (err) {
-    console.error("[/search]", err.message)
-    res.status(500).json({ error: "Search failed", details: err.message })
+    console.error(`[extractM3u8] Error for ${iframeUrl}:`, err.message)
   }
-})
+  return null
+}
 
 function groupVideosByAudio(html) {
   const groups = { hsub: [], sub: [], dub: [] }
-  
-  // 1. Identify all audio markers
   const markerRegex = /data-id=["'](hsub|sub|dub|softsub)["']/gi
   const markerPositions = []
   let m
   while ((m = markerRegex.exec(html)) !== null) {
     let type = m[1].toLowerCase()
     if (type === "softsub") type = "sub"
-    markerPositions.push({ pos: m.index, type: type })
+    markerPositions.push({ pos: m.index, type })
   }
 
-  // 2. Identify all video entries
   const videoRegex = /data-video=["']([^"']+)["']/gi
   const videoEntries = []
   let v
@@ -127,7 +124,6 @@ function groupVideosByAudio(html) {
     videoEntries.push({ url: v[1], pos: v.index })
   }
 
-  // 3. Heuristic: If markers exist, group by preceding marker
   if (markerPositions.length > 0) {
     for (const entry of videoEntries) {
       let bestType = null
@@ -144,9 +140,7 @@ function groupVideosByAudio(html) {
         }
       }
     }
-  } 
-  // 4. Fallback: If no markers found but videos exist, put them in 'hsub' as default
-  else if (videoEntries.length > 0) {
+  } else if (videoEntries.length > 0) {
     for (const entry of videoEntries) {
       const cleanUrl = entry.url.split("?")[0]
       if (!groups.hsub.some((u) => u.split("?")[0] === cleanUrl)) {
@@ -157,6 +151,91 @@ function groupVideosByAudio(html) {
 
   return groups
 }
+
+app.get("/", (req, res) => {
+  const base = getBaseUrl(req)
+  res.json({
+    status: "ok",
+    service: "HLS Streams Scraper & Proxy",
+    publicBase: base,
+    endpoints: {
+      search: "GET /search?q=naruto",
+      scrape: "GET /scrape?slug=one-piece&ep=1[&type=sub|dub|hsub]",
+      extract: "GET /extract?url=ENCODED_EMBED_URL",
+      proxyM3u8: "GET /proxy?url=ENCODED_M3U8_URL&ref=ENCODED_REFERER",
+      proxySegment: "GET /segment?url=ENCODED_SEGMENT_URL&ref=ENCODED_REFERER",
+      proxyKey: "GET /key?url=ENCODED_KEY_URL&ref=ENCODED_REFERER",
+      debug: "GET /debug-html?slug=one-piece&ep=1",
+    },
+  })
+})
+
+app.get("/search", async (req, res) => {
+  const query = req.query.q
+  if (!query) return res.status(400).json({ error: "Missing ?q parameter" })
+
+  try {
+    const url = `${ANINEKO_BASE}/browser?keyword=${encodeURIComponent(query)}`
+    const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 9000 })
+    const $ = cheerio.load(html)
+    const results = []
+    const seen = new Set()
+
+    $(".nv-anime-card, .film-item, a[href*='/watch/']").each((_, el) => {
+      const $el = $(el)
+      const href = $el.is("a") ? $el.attr("href") : ($el.find("a[href*='/watch/']").first().attr("href") || "")
+      const match = href ? href.match(/\/watch\/([^/?#]+)/) : null
+      if (!match) return
+      const slug = match[1]
+      if (seen.has(slug)) return
+      seen.add(slug)
+
+      let title =
+        $el.find(".name, .title, h3, h4").first().text().trim() ||
+        $el.attr("title") ||
+        $el.find("img").attr("alt") ||
+        $el.text().trim().slice(0, 100) ||
+        slug.replace(/-/g, " ")
+
+      title = title.split("\n")[0].trim()
+      title = title.replace(/\s+(TV|Movie|Special|OVA|ONA)\s*$/i, "").trim()
+      title = title.replace(/\s+CC\s+\d+.*$/i, "").trim()
+      const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
+
+      if (slug && title) {
+        results.push({ slug, title, image: img })
+      }
+    })
+
+    res.json({ results, total: results.length })
+  } catch (err) {
+    res.status(500).json({ error: "Search failed", details: err.message })
+  }
+})
+
+app.get("/extract", async (req, res) => {
+  const { url } = req.query
+  if (!url) return res.status(400).json({ error: "Missing ?url parameter" })
+
+  try {
+    const streamUrl = await extractM3u8FromEmbed(url)
+    if (!streamUrl) {
+      return res.status(404).json({ error: "No HLS stream found for given embed" })
+    }
+
+    const base = getBaseUrl(req)
+    const ref = getOrigin(url)
+
+    res.json({
+      originalUrl: url,
+      serverName: getServerName(url),
+      streamUrl,
+      proxiedM3u8: `${base}/proxy?url=${encodeURIComponent(streamUrl)}&ref=${encodeURIComponent(ref)}`,
+    })
+  } catch (err) {
+    res.status(500).json({ error: "Extraction failed", details: err.message })
+  }
+})
 
 app.get("/scrape", async (req, res) => {
   const { slug, ep, type } = req.query
@@ -171,8 +250,7 @@ app.get("/scrape", async (req, res) => {
     const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
 
     const grouped = groupVideosByAudio(html)
-    const totalFound =
-      grouped.hsub.length + grouped.sub.length + grouped.dub.length
+    const totalFound = grouped.hsub.length + grouped.sub.length + grouped.dub.length
 
     if (totalFound === 0) {
       return res.status(404).json({
@@ -192,6 +270,7 @@ app.get("/scrape", async (req, res) => {
       }
     }
 
+    const base = getBaseUrl(req)
     const results = await Promise.all(
       toProcess.map(async ({ url, audio }) => {
         try {
@@ -199,7 +278,6 @@ app.get("/scrape", async (req, res) => {
           if (!m3u8) return null
           const cleanUrl = url.split("?")[0]
           const origin = getOrigin(cleanUrl)
-          const base = PUBLIC_BASE || `https://${req.get('host')}`
           return {
             serverName: getServerName(cleanUrl),
             audio,
@@ -208,7 +286,7 @@ app.get("/scrape", async (req, res) => {
             m3u8,
             proxiedM3u8: `${base}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
           }
-        } catch (err) {
+        } catch {
           return null
         }
       }),
@@ -218,7 +296,7 @@ app.get("/scrape", async (req, res) => {
 
     if (sources.length === 0) {
       return res.status(500).json({
-        error: "No m3u8 extracted from any embed",
+        error: "No HLS streams extracted from embed servers",
         groupedCounts: {
           hsub: grouped.hsub.length,
           sub: grouped.sub.length,
@@ -256,21 +334,36 @@ app.get("/proxy", async (req, res) => {
 
   try {
     const upstream = await axios.get(url, {
-      headers: { ...COMMON_HEADERS, Referer: ref, Origin: ref.replace(/\/$/, "") },
+      headers: {
+        ...COMMON_HEADERS,
+        Referer: ref,
+        Origin: ref.replace(/\/$/, ""),
+      },
       responseType: "text",
       timeout: 9000,
     })
 
     let body = upstream.data
-        const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
-    const base = PUBLIC_BASE || `https://${req.get('host')}`
+    const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
+    const base = getBaseUrl(req)
 
+    // Rewrite HLS manifest lines
     body = body
       .split("\n")
       .map((line) => {
         const trimmed = line.trim()
-        if (!trimmed || trimmed.startsWith("#")) return line
-        const absoluteUrl = trimmed.startsWith("http") ? trimmed : new URL(trimmed, baseUrl).href
+        if (!trimmed) return line
+
+        // Rewrite URI in tags (e.g. #EXT-X-KEY, #EXT-X-MAP)
+        if (trimmed.startsWith("#")) {
+          return line.replace(/URI=["']([^"']+)["']/i, (_, uriVal) => {
+            const absKeyUrl = normalizeUrl(uriVal, baseUrl)
+            const proxiedKey = `${base}/key?url=${encodeURIComponent(absKeyUrl)}&ref=${encodeURIComponent(ref)}`
+            return `URI="${proxiedKey}"`
+          })
+        }
+
+        const absoluteUrl = normalizeUrl(trimmed, baseUrl)
         if (absoluteUrl.includes(".m3u8")) {
           return `${base}/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
         } else {
@@ -281,6 +374,7 @@ app.get("/proxy", async (req, res) => {
 
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl")
     res.setHeader("Access-Control-Allow-Origin", "*")
+    res.setHeader("Access-Control-Allow-Headers", "*")
     res.setHeader("Cache-Control", "no-cache")
     res.send(body)
   } catch (err) {
@@ -294,80 +388,69 @@ app.get("/segment", async (req, res) => {
   if (!url) return res.status(400).send("Missing url")
 
   try {
+    const headers = {
+      ...COMMON_HEADERS,
+      Referer: ref,
+      Origin: ref.replace(/\/$/, ""),
+    }
+    if (req.headers.range) {
+      headers.range = req.headers.range
+    }
+
     const upstream = await axios.get(url, {
-      headers: { ...COMMON_HEADERS, Referer: ref, Origin: ref.replace(/\/$/, "") },
+      headers,
       responseType: "stream",
-      timeout: 9000,
+      timeout: 12000,
     })
-    res.setHeader("Content-Type", "video/mp2t")
+
+    if (upstream.headers["content-type"]) {
+      res.setHeader("Content-Type", upstream.headers["content-type"])
+    } else {
+      res.setHeader("Content-Type", "video/mp2t")
+    }
+
+    if (upstream.headers["content-length"]) {
+      res.setHeader("Content-Length", upstream.headers["content-length"])
+    }
+    if (upstream.headers["content-range"]) {
+      res.setHeader("Content-Range", upstream.headers["content-range"])
+      res.status(206)
+    }
+
     res.setHeader("Access-Control-Allow-Origin", "*")
-    res.setHeader("Cache-Control", "public, max-age=3600")
+    res.setHeader("Access-Control-Allow-Headers", "*")
+    res.setHeader("Cache-Control", "public, max-age=86400")
     upstream.data.pipe(res)
   } catch (err) {
     res.status(502).send("Segment failed: " + err.message)
   }
 })
 
-async function extractM3u8FromEmbed(iframeUrl) {
+app.get("/key", async (req, res) => {
+  const url = req.query.url
+  const ref = req.query.ref || "https://vivibebe.site/"
+  if (!url) return res.status(400).send("Missing url")
+
   try {
-    const { data: html } = await axios.get(iframeUrl, {
-      headers: { ...COMMON_HEADERS, Referer: `${ANINEKO_BASE}/` },
+    const upstream = await axios.get(url, {
+      headers: {
+        ...COMMON_HEADERS,
+        Referer: ref,
+        Origin: ref.replace(/\/$/, ""),
+      },
+      responseType: "arraybuffer",
       timeout: 9000,
     })
 
-    // Priority 1: Direct master.m3u8
-    const m3u8Master = html.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
-    if (m3u8Master) return m3u8Master[0]
-
-    // Priority 2: Standard .m3u8
-    const m3u8Generic = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
-    if (m3u8Generic) return m3u8Generic[0]
-
-    // Priority 3: Player source definitions
-    const sourceMatch = html.match(/(?:file|source|src|link)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
-    if (sourceMatch) return sourceMatch[1]
-
-    // Priority 4: Base64 encoded URLs
-    const b64Regex = /[A-Za-z0-9+/]{40,}={0,2}/g
-    const matches = html.match(b64Regex) || []
-    for (const b64 of matches) {
-      try {
-        const decoded = Buffer.from(b64, 'base64').toString('utf-8')
-        if (decoded.includes('.m3u8')) {
-          const found = decoded.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
-          if (found) return found[0]
-        }
-      } catch (e) {}
-    }
+    res.setHeader("Content-Type", "application/octet-stream")
+    res.setHeader("Access-Control-Allow-Origin", "*")
+    res.setHeader("Access-Control-Allow-Headers", "*")
+    res.setHeader("Cache-Control", "public, max-age=86400")
+    res.send(Buffer.from(upstream.data))
   } catch (err) {
-    console.error(`[extractM3u8] Error for ${iframeUrl}:`, err.message)
+    res.status(502).send("Key fetch failed: " + err.message)
   }
-  return null
-}
-
-function getOrigin(url) {
-  try {
-    const u = new URL(url)
-    return `${u.protocol}//${u.hostname}/`
-  } catch {
-    return "https://vivibebe.site/"
-  }
-}
-
-function getServerName(url) {
-  try {
-    const u = new URL(url)
-    const host = u.hostname.replace(/^www\./, "")
-    if (host.includes("vivibebe")) return "VibePlayer"
-    if (host.includes("bibiemb")) return "BibiEmb"
-    if (host.includes("otakuhg")) return "OtakuHG"
-    if (host.includes("otakuvid")) return "OtakuVid"
-    if (host.includes("playmogo")) return "PlayMogo"
-    return host.split(".")[0]
-  } catch {
-    return "Unknown"
-  }
-}
+})
 
 app.get("/debug-html", async (req, res) => {
   const { slug, ep } = req.query
@@ -390,5 +473,6 @@ app.get("/debug-html", async (req, res) => {
   }
 })
 
+// ponytail: Express wrapper for Netlify/Vercel serverless. Upgrade to fastify/hono if high throughput needed.
 const handler = serverless(app)
 export { handler }
