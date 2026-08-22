@@ -11,6 +11,7 @@ app.use(express.json())
 
 const SOURCES = {
   anineko: process.env.ANINEKO_BASE || "https://anineko.to",
+  reanime: process.env.REANIME_BASE || "https://reanime.to",
   anikoto: process.env.ANIKOTO_BASE || "https://anikototv.to",
   animepahe: process.env.ANIMEPAHE_BASE || "https://animepahe.ru",
 }
@@ -55,6 +56,7 @@ function getServerName(url) {
     const host = u.hostname.replace(/^www\./, "").toLowerCase()
     if (host.includes("vivibebe")) return "VibePlayer"
     if (host.includes("vibevibe") || host.includes("workers.dev")) return "VibeWorker"
+    if (host.includes("reanime")) return "ReAnime"
     if (host.includes("kwik")) return "Kwik"
     if (host.includes("pahe") || host.includes("animepahe")) return "AnimePahe"
     if (host.includes("bibiemb")) return "BibiEmb"
@@ -123,7 +125,7 @@ async function extractM3u8FromEmbed(iframeUrl, referer = SOURCES.anineko) {
 
     let text = typeof html === "string" ? html : JSON.stringify(html)
 
-    // Unpack obfuscated JS (e.g. Kwik player used by AnimePahe)
+    // Unpack obfuscated JS
     if (text.includes("eval(function(p,a,c,k,e,d)")) {
       text = unpackJs(text)
     }
@@ -140,7 +142,7 @@ async function extractM3u8FromEmbed(iframeUrl, referer = SOURCES.anineko) {
     const sourceMatch = text.match(/(?:file|source|src|link)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
     if (sourceMatch) return sourceMatch[1]
 
-    // 4. Pahe kwik token / mp4 fallback
+    // 4. Kwik / custom player fallback
     const kwikSource = text.match(/source\s*=\s*["']([^"']+)["']/i)
     if (kwikSource && (kwikSource[1].includes(".m3u8") || kwikSource[1].includes(".mp4"))) {
       return kwikSource[1]
@@ -219,7 +221,7 @@ function parseVideosFromHtml(html) {
   return groups
 }
 
-// Scrape helpers per source
+// Search per source
 async function searchAnineko(query) {
   const url = `${SOURCES.anineko}/browser?keyword=${encodeURIComponent(query)}`
   const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 9000 })
@@ -253,6 +255,43 @@ async function searchAnineko(query) {
     }
   })
   return results
+}
+
+async function searchReAnime(query) {
+  try {
+    const url = `${SOURCES.reanime}/browser?keyword=${encodeURIComponent(query)}`
+    const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 9000 })
+    const $ = cheerio.load(html)
+    const results = []
+    const seen = new Set()
+
+    $(".nv-anime-card, .film-item, a[href*='/watch/']").each((_, el) => {
+      const $el = $(el)
+      const href = $el.is("a") ? $el.attr("href") : ($el.find("a[href*='/watch/']").first().attr("href") || "")
+      const match = href ? href.match(/\/watch\/([^/?#]+)/) : null
+      if (!match) return
+      const slug = match[1]
+      if (seen.has(slug)) return
+      seen.add(slug)
+
+      let title =
+        $el.find(".name, .title, h3, h4").first().text().trim() ||
+        $el.attr("title") ||
+        $el.find("img").attr("alt") ||
+        slug.replace(/-/g, " ")
+
+      title = title.split("\n")[0].trim()
+      title = title.replace(/\s+(TV|Movie|Special|OVA|ONA)\s*$/i, "").trim()
+      const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
+
+      if (slug && title) {
+        results.push({ source: "reanime", slug, title, image: img })
+      }
+    })
+    return results
+  } catch {
+    return []
+  }
 }
 
 async function searchAnikoto(query) {
@@ -310,10 +349,10 @@ app.get("/", (req, res) => {
     status: "ok",
     service: "MoeMotion Multi-Source HLS Scraper & Proxy",
     publicBase: base,
-    sources: ["anineko (default)", "anikoto", "animepahe"],
+    sources: ["anineko (default)", "reanime", "anikoto", "animepahe"],
     endpoints: {
-      search: "GET /search?q=classroom-of-the-elite[&source=anineko|anikoto|animepahe|all]",
-      scrape: "GET /scrape?slug=classroom-of-the-elite-iv&ep=1[&source=anineko|anikoto|animepahe][&type=sub|dub|hsub]",
+      search: "GET /search?q=one-piece[&source=anineko|reanime|anikoto|animepahe|all]",
+      scrape: "GET /scrape?slug=one-piece&ep=1[&source=anineko|reanime|anikoto|animepahe][&type=sub|dub|hsub]",
       extract: "GET /extract?url=ENCODED_EMBED_OR_M3U8_URL",
       proxyM3u8: "GET /proxy?url=ENCODED_M3U8_URL&ref=ENCODED_REFERER",
       proxySegment: "GET /segment?url=ENCODED_SEGMENT_URL&ref=ENCODED_REFERER",
@@ -330,13 +369,16 @@ app.get("/search", async (req, res) => {
   try {
     let results = []
 
-    if (source === "anikoto") {
+    if (source === "reanime") {
+      results = await searchReAnime(query)
+    } else if (source === "anikoto") {
       results = await searchAnikoto(query)
     } else if (source === "animepahe") {
       results = await searchAnimePahe(query)
     } else if (source === "all") {
-      const [r1, r2, r3] = await Promise.allSettled([
+      const [r1, r2, r3, r4] = await Promise.allSettled([
         searchAnineko(query),
+        searchReAnime(query),
         searchAnikoto(query),
         searchAnimePahe(query),
       ])
@@ -344,6 +386,7 @@ app.get("/search", async (req, res) => {
         ...(r1.status === "fulfilled" ? r1.value : []),
         ...(r2.status === "fulfilled" ? r2.value : []),
         ...(r3.status === "fulfilled" ? r3.value : []),
+        ...(r4.status === "fulfilled" ? r4.value : []),
       ]
     } else {
       results = await searchAnineko(query)
@@ -392,11 +435,13 @@ app.get("/scrape", async (req, res) => {
     let epUrl = `${SOURCES.anineko}/watch/${slug}/ep-${ep}`
     let baseRef = SOURCES.anineko
 
-    if (source === "anikoto") {
+    if (source === "reanime") {
+      epUrl = `${SOURCES.reanime}/watch/${slug}/ep-${ep}`
+      baseRef = SOURCES.reanime
+    } else if (source === "anikoto") {
       epUrl = `${SOURCES.anikoto}/watch/${slug}/ep-${ep}`
       baseRef = SOURCES.anikoto
     } else if (source === "animepahe") {
-      // AnimePahe release session query
       const paheApi = `${SOURCES.animepahe}/api?m=release&id=${slug}&sort=episode_asc&page=1`
       const { data: releaseData } = await axios.get(paheApi, { headers: COMMON_HEADERS, timeout: 9000 })
       const episodeMatch = releaseData?.data?.find((d) => String(d.episode) === String(ep))
