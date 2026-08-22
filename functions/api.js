@@ -73,7 +73,6 @@ function getServerName(url) {
   }
 }
 
-// Unpack JS eval if packed with p,a,c,k,e,d
 function unpackJs(packed) {
   try {
     const match = packed.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]+?return p\}\('([\s\S]+?)',(\d+),(\d+),'([\s\S]+?)'\.split\('\|'\)/)
@@ -111,7 +110,7 @@ function unpackJs(packed) {
 async function extractM3u8FromEmbed(iframeUrl, referer = SOURCES.anineko) {
   try {
     const targetUrl = iframeUrl.trim()
-    if (targetUrl.includes(".m3u8")) {
+    if (targetUrl.includes(".m3u8") || targetUrl.includes(".mp4")) {
       return targetUrl
     }
 
@@ -125,37 +124,34 @@ async function extractM3u8FromEmbed(iframeUrl, referer = SOURCES.anineko) {
 
     let text = typeof html === "string" ? html : JSON.stringify(html)
 
-    // Unpack obfuscated JS
     if (text.includes("eval(function(p,a,c,k,e,d)")) {
       text = unpackJs(text)
     }
 
-    // 1. Direct master.m3u8 pattern
     const m3u8Master = text.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
     if (m3u8Master) return m3u8Master[0]
 
-    // 2. Direct generic .m3u8 pattern
     const m3u8Generic = text.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
     if (m3u8Generic) return m3u8Generic[0]
 
-    // 3. Player source keys
-    const sourceMatch = text.match(/(?:file|source|src|link)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
+    const mp4Direct = text.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/i)
+    if (mp4Direct) return mp4Direct[0]
+
+    const sourceMatch = text.match(/(?:file|source|src|link)\s*[:=]\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i)
     if (sourceMatch) return sourceMatch[1]
 
-    // 4. Kwik / custom player fallback
     const kwikSource = text.match(/source\s*=\s*["']([^"']+)["']/i)
     if (kwikSource && (kwikSource[1].includes(".m3u8") || kwikSource[1].includes(".mp4"))) {
       return kwikSource[1]
     }
 
-    // 5. Base64 encoded stream URLs
     const b64Regex = /[A-Za-z0-9+/]{40,}={0,2}/g
     const matches = text.match(b64Regex) || []
     for (const b64 of matches) {
       try {
         const decoded = Buffer.from(b64, "base64").toString("utf-8")
-        if (decoded.includes(".m3u8")) {
-          const found = decoded.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
+        if (decoded.includes(".m3u8") || decoded.includes(".mp4")) {
+          const found = decoded.match(/https?:\/\/[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*/i)
           if (found) return found[0]
         }
       } catch {}
@@ -187,9 +183,9 @@ function parseVideosFromHtml(html) {
     }
   }
 
-  const directM3u8Regex = /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi
+  const directStreamRegex = /https?:\/\/[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*/gi
   let directMatch
-  while ((directMatch = directM3u8Regex.exec(html)) !== null) {
+  while ((directMatch = directStreamRegex.exec(html)) !== null) {
     videoEntries.push({ url: directMatch[0], pos: directMatch.index })
   }
 
@@ -221,7 +217,6 @@ function parseVideosFromHtml(html) {
   return groups
 }
 
-// Search per source
 async function searchAnineko(query) {
   const url = `${SOURCES.anineko}/browser?keyword=${encodeURIComponent(query)}`
   const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 9000 })
@@ -343,16 +338,44 @@ async function searchAnimePahe(query) {
   }
 }
 
+async function fetchPaheDownloadLinks(releaseId, episodeNum) {
+  try {
+    const listUrl = `${SOURCES.animepahe}/api?m=release&id=${releaseId}&sort=episode_asc&page=1`
+    const { data: releaseData } = await axios.get(listUrl, { headers: COMMON_HEADERS, timeout: 9000 })
+    const ep = releaseData?.data?.find((d) => String(d.episode) === String(episodeNum))
+    if (!ep || !ep.session) return []
+
+    const playUrl = `${SOURCES.animepahe}/play/${releaseId}/${ep.session}`
+    const { data: playHtml } = await axios.get(playUrl, { headers: COMMON_HEADERS, timeout: 9000 })
+    const $ = cheerio.load(playHtml)
+    const downloadOptions = []
+
+    $("#pickDownload a").each((_, el) => {
+      const $a = $(el)
+      const link = $a.attr("href") || ""
+      const label = $a.text().trim()
+      if (link) {
+        downloadOptions.push({ quality: label, link })
+      }
+    })
+    return downloadOptions
+  } catch {
+    return []
+  }
+}
+
 app.get("/", (req, res) => {
   const base = getBaseUrl(req)
   res.json({
     status: "ok",
-    service: "MoeMotion Multi-Source HLS Scraper & Proxy",
+    service: "MoeMotion Multi-Source HLS & Download Scraper",
     publicBase: base,
     sources: ["anineko (default)", "reanime", "anikoto", "animepahe"],
     endpoints: {
       search: "GET /search?q=one-piece[&source=anineko|reanime|anikoto|animepahe|all]",
       scrape: "GET /scrape?slug=one-piece&ep=1[&source=anineko|reanime|anikoto|animepahe][&type=sub|dub|hsub]",
+      download: "GET /download?slug=one-piece&ep=1[&source=anineko|reanime|animepahe]",
+      downloadStream: "GET /download/file?url=ENCODED_STREAM_URL&filename=episode1.mp4",
       extract: "GET /extract?url=ENCODED_EMBED_OR_M3U8_URL",
       proxyM3u8: "GET /proxy?url=ENCODED_M3U8_URL&ref=ENCODED_REFERER",
       proxySegment: "GET /segment?url=ENCODED_SEGMENT_URL&ref=ENCODED_REFERER",
@@ -368,7 +391,6 @@ app.get("/search", async (req, res) => {
 
   try {
     let results = []
-
     if (source === "reanime") {
       results = await searchReAnime(query)
     } else if (source === "anikoto") {
@@ -391,10 +413,108 @@ app.get("/search", async (req, res) => {
     } else {
       results = await searchAnineko(query)
     }
-
     res.json({ results, total: results.length, source })
   } catch (err) {
     res.status(500).json({ error: "Search failed", details: err.message })
+  }
+})
+
+app.get("/download", async (req, res) => {
+  const { slug, ep } = req.query
+  const source = (req.query.source || "anineko").toLowerCase()
+  if (!slug || !ep) return res.status(400).json({ error: "Missing slug or ep" })
+
+  try {
+    const base = getBaseUrl(req)
+
+    if (source === "animepahe") {
+      const links = await fetchPaheDownloadLinks(slug, ep)
+      return res.json({
+        source,
+        slug,
+        episode: ep,
+        downloads: links.map((l) => ({
+          quality: l.quality,
+          downloadUrl: l.link,
+          proxiedDownload: `${base}/download/file?url=${encodeURIComponent(l.link)}&filename=${encodeURIComponent(`${slug}-ep${ep}.mp4`)}`,
+        })),
+      })
+    }
+
+    // Default: Scrape streams and generate direct download headers
+    let epUrl = `${SOURCES.anineko}/watch/${slug}/ep-${ep}`
+    let baseRef = SOURCES.anineko
+    if (source === "reanime") {
+      epUrl = `${SOURCES.reanime}/watch/${slug}/ep-${ep}`
+      baseRef = SOURCES.reanime
+    }
+
+    const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
+    const grouped = parseVideosFromHtml(html)
+    const allVideos = [...grouped.hsub, ...grouped.sub, ...grouped.dub]
+
+    const streams = await Promise.all(
+      allVideos.map(async (url) => {
+        try {
+          const m3u8 = await extractM3u8FromEmbed(url, baseRef)
+          if (!m3u8) return null
+          const cleanUrl = url.split("?")[0]
+          return {
+            server: getServerName(cleanUrl),
+            streamUrl: m3u8,
+            proxiedStream: `${base}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(getOrigin(cleanUrl))}`,
+            directDownloadUrl: `${base}/download/file?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(getOrigin(cleanUrl))}&filename=${encodeURIComponent(`${slug}-ep${ep}.m3u8`)}`,
+          }
+        } catch {
+          return null
+        }
+      }),
+    )
+
+    const downloads = streams.filter(Boolean)
+
+    res.json({
+      source,
+      slug,
+      episode: ep,
+      downloads,
+      total: downloads.length,
+    })
+  } catch (err) {
+    res.status(500).json({ error: "Download resolution failed", details: err.message })
+  }
+})
+
+app.get("/download/file", async (req, res) => {
+  const { url, filename, ref } = req.query
+  if (!url) return res.status(400).send("Missing url")
+
+  const targetName = filename || "episode.mp4"
+  const referer = ref || getOrigin(url)
+
+  try {
+    const upstream = await axios.get(url, {
+      headers: {
+        ...COMMON_HEADERS,
+        Referer: referer,
+        Origin: referer.replace(/\/$/, ""),
+      },
+      responseType: "stream",
+      timeout: 15000,
+    })
+
+    const contentType = upstream.headers["content-type"] || "application/octet-stream"
+    res.setHeader("Content-Type", contentType)
+    res.setHeader("Content-Disposition", `attachment; filename="${targetName}"`)
+    res.setHeader("Access-Control-Allow-Origin", "*")
+
+    if (upstream.headers["content-length"]) {
+      res.setHeader("Content-Length", upstream.headers["content-length"])
+    }
+
+    upstream.data.pipe(res)
+  } catch (err) {
+    res.status(502).send("Direct download proxy failed: " + err.message)
   }
 })
 
@@ -416,6 +536,7 @@ app.get("/extract", async (req, res) => {
       serverName: getServerName(url),
       streamUrl,
       proxiedM3u8: `${base}/proxy?url=${encodeURIComponent(streamUrl)}&ref=${encodeURIComponent(origin)}`,
+      downloadUrl: `${base}/download/file?url=${encodeURIComponent(streamUrl)}&ref=${encodeURIComponent(origin)}&filename=stream.m3u8`,
     })
   } catch (err) {
     res.status(500).json({ error: "Extraction failed", details: err.message })
@@ -491,6 +612,7 @@ app.get("/scrape", async (req, res) => {
             originalEmbedUrl: url,
             m3u8,
             proxiedM3u8: `${base}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
+            downloadUrl: `${base}/download/file?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}&filename=${encodeURIComponent(`${slug}-ep${ep}.m3u8`)}`,
           }
         } catch {
           return null
@@ -658,6 +780,5 @@ app.get("/key", async (req, res) => {
   }
 })
 
-// ponytail: Express wrapper for Netlify/Vercel serverless. Upgrade to fastify/hono if high throughput needed.
 const handler = serverless(app)
 export { handler }
