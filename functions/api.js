@@ -3,12 +3,19 @@ import axios from "axios"
 import * as cheerio from "cheerio"
 import cors from "cors"
 import serverless from "serverless-http"
+import https from "https"
+import crypto from "crypto"
 
 const app = express()
 
 app.use(cors({ origin: "*" }))
 
-const ANINEKO_BASE = "https://anineko.to"
+const httpsAgent = new https.Agent({ rejectUnauthorized: false })
+
+const HIANIME_BASE = "https://hianime.gr"
+const MEGAPLAY_BASE = "https://megaplay.buzz"
+const GOGO_STREAM_BASE = "https://gogoanime.com.by"
+
 const COMMON_HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -19,20 +26,54 @@ const COMMON_HEADERS = {
 
 const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || ""
 
+function getBaseUrl(req) {
+  if (PUBLIC_BASE) return PUBLIC_BASE
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http"
+  const host = req.get("host") || "localhost:3000"
+  return `${proto}://${host}`
+}
+
+const KNOWN_EP_OFFSETS = {
+  "one-piece": 2142,
+  "one-piece-odmau": 2142,
+}
+
+function decryptEnc(encStr) {
+  try {
+    let b64 = encStr.replace(/-/g, "+").replace(/_/g, "/")
+    const mod = b64.length % 4
+    if (mod) b64 += "=".repeat(4 - mod)
+    const encryptedBuf = Buffer.from(b64, "base64")
+
+    const keyStr = "i?LMTAx0Q6,:}50U"
+    const key = Buffer.alloc(32)
+    Buffer.from(keyStr, "utf-8").copy(key, 0, 0, Math.min(32, keyStr.length))
+    const iv = Buffer.from("W0;27ToaUpl_P%'c", "utf-8")
+
+    const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv)
+    let decrypted = decipher.update(encryptedBuf, null, "utf-8")
+    decrypted += decipher.final("utf-8")
+    return JSON.parse(decrypted)
+  } catch (err) {
+    console.error("[decryptEnc error]", err.message)
+    return null
+  }
+}
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
-    service: "AniNeko Scraper",
+    service: "HiAnime / MoeMotion Scraper API",
     publicBase: PUBLIC_BASE,
     endpoints: [
       "GET /search?q=naruto",
-      "GET /scrape?slug=one-piece&ep=1               (returns all sources grouped by audio)",
-      "GET /scrape?slug=one-piece&ep=1&type=sub      (only sub sources)",
-      "GET /scrape?slug=one-piece&ep=1&type=dub      (only dub sources)",
-      "GET /scrape?slug=one-piece&ep=1&type=hsub     (only hardsub sources)",
+      "GET /scrape?slug=one-piece-odmau&ep=1               (returns all sources grouped by audio)",
+      "GET /scrape?slug=one-piece-odmau&ep=1&type=sub      (only sub sources)",
+      "GET /scrape?slug=one-piece-odmau&ep=1&type=dub      (only dub sources)",
+      "GET /scrape?slug=one-piece-odmau&ep=1&type=hsub     (only hardsub sources)",
       "GET /proxy?url=ENCODED_M3U8_URL",
       "GET /segment?url=ENCODED_SEGMENT_URL",
-      "GET /debug-html?slug=one-piece&ep=1",
+      "GET /debug-html?slug=one-piece-odmau&ep=1",
     ],
   })
 })
@@ -42,31 +83,31 @@ app.get("/search", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing ?q parameter" })
 
   try {
-    const url = `${ANINEKO_BASE}/browser?keyword=${encodeURIComponent(query)}`
-    const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, timeout: 9000 })
+    const url = `${HIANIME_BASE}/search?keyword=${encodeURIComponent(query)}`
+    const { data: html } = await axios.get(url, { headers: COMMON_HEADERS, httpsAgent, timeout: 9000 })
     const $ = cheerio.load(html)
     const results = []
     const seen = new Set()
 
-    $(".nv-anime-card").each((_, el) => {
+    $(".flw-item").each((_, el) => {
       const $el = $(el)
       const $link = $el.find("a[href*='/watch/']").first()
       const href = $link.attr("href") || ""
       const match = href.match(/\/watch\/([^/?#]+)/)
       if (!match) return
-      const slug = match[1]
+
+      let slug = match[1].replace(/\/ep-\d+.*$/, "")
       if (seen.has(slug)) return
       seen.add(slug)
 
-      let title = $el.find(".name, .title, h3, h4").text().trim() || $link.text().trim()
-      // Clean up title from common AniNeko noise
-      title = title.split("\n")[0].trim()
-      title = title.replace(/\s+(TV|Movie|Special|OVA|ONA)\s*$/i, "").trim()
-      title = title.replace(/\s+CC\s+\d+.*$/i, "").trim()
-      const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
+      let title = $el.find(".film-name a, .dynamic-name").first().text().trim() || $link.attr("title") || ""
+      if (!title) {
+        title = $el.find(".film-name, .name, .title, h3").first().text().trim()
+      }
+      const img = $el.find("img").attr("data-src") || $el.find("img").attr("src") || ""
 
       if (slug && title) {
-        results.push({ slug, title, image: img })
+        results.push({ slug, title: title.split("\n")[0].trim(), image: img })
       }
     })
 
@@ -76,25 +117,16 @@ app.get("/search", async (req, res) => {
         const href = $el.attr("href") || ""
         const match = href.match(/\/watch\/([^/?#]+)/)
         if (!match) return
-        const slug = match[1]
+
+        let slug = match[1].replace(/\/ep-\d+.*$/, "")
         if (seen.has(slug)) return
         seen.add(slug)
 
-        let title =
-          $el.find(".name, .title, h3, h4").text().trim() ||
-          $el.attr("title") ||
-          $el.find("img").attr("alt") ||
-          $el.text().trim().slice(0, 100) ||
-          slug.replace(/-/g, " ")
-        
-        title = title.split("\n")[0].trim()
-        title = title.replace(/\s+(TV|Movie|Special|OVA|ONA)\s*$/i, "").trim()
-        title = title.replace(/\s+CC\s+\d+.*$/i, "").trim()
-
-        const img = $el.find("img").attr("src") || $el.find("img").attr("data-src") || ""
+        const title = $el.attr("title") || $el.find("img").attr("alt") || $el.text().trim() || slug
+        const img = $el.find("img").attr("data-src") || $el.find("img").attr("src") || ""
 
         if (slug && title && title.length < 200) {
-          results.push({ slug, title, image: img })
+          results.push({ slug, title: title.split("\n")[0].trim(), image: img })
         }
       })
     }
@@ -102,60 +134,100 @@ app.get("/search", async (req, res) => {
     res.json({ results })
   } catch (err) {
     console.error("[/search]", err.message)
-    res.status(500).json({ error: "Search failed", details: err.message })
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Search failed", details: err.message })
+    }
   }
 })
 
-function groupVideosByAudio(html) {
-  const groups = { hsub: [], sub: [], dub: [] }
+async function resolveEpisodeId(slug, epNumStr) {
+  const epNum = parseInt(epNumStr, 10)
   
-  // 1. Identify all audio markers
-  const markerRegex = /data-id=["'](hsub|sub|dub|softsub)["']/gi
-  const markerPositions = []
-  let m
-  while ((m = markerRegex.exec(html)) !== null) {
-    let type = m[1].toLowerCase()
-    if (type === "softsub") type = "sub"
-    markerPositions.push({ pos: m.index, type: type })
+  // If epNumStr is already a numeric ID
+  if (!isNaN(epNum) && epNum > 2000) {
+    return epNum
   }
 
-  // 2. Identify all video entries
-  const videoRegex = /data-video=["']([^"']+)["']/gi
-  const videoEntries = []
-  let v
-  while ((v = videoRegex.exec(html)) !== null) {
-    videoEntries.push({ url: v[1], pos: v.index })
+  // Check known offset map
+  const cleanSlug = slug.toLowerCase().trim()
+  if (KNOWN_EP_OFFSETS[cleanSlug] && !isNaN(epNum)) {
+    return KNOWN_EP_OFFSETS[cleanSlug] + (epNum - 1)
   }
 
-  // 3. Heuristic: If markers exist, group by preceding marker
-  if (markerPositions.length > 0) {
-    for (const entry of videoEntries) {
-      let bestType = null
-      for (let i = markerPositions.length - 1; i >= 0; i--) {
-        if (markerPositions[i].pos < entry.pos) {
-          bestType = markerPositions[i].type
-          break
+  // Fetch watch page to extract anime data-id or streaming iframe ep ID
+  try {
+    const watchUrl = `${HIANIME_BASE}/watch/${slug}/ep-${epNumStr}`
+    const { data: watchHtml } = await axios.get(watchUrl, { headers: COMMON_HEADERS, httpsAgent, timeout: 9000 })
+    const $ = cheerio.load(watchHtml)
+
+    const streamingMatch = watchHtml.match(/ep=(\d+)/i)
+    if (streamingMatch) {
+      return parseInt(streamingMatch[1], 10)
+    }
+
+    const animeId = $("[data-id]").first().attr("data-id")
+    if (animeId) {
+      const listUrl = `${HIANIME_BASE}/ajax/episode/list/${animeId}`
+      const { data: listData } = await axios.get(listUrl, {
+        headers: { ...COMMON_HEADERS, "X-Requested-With": "XMLHttpRequest" },
+        httpsAgent,
+        timeout: 9000
+      })
+      const listHtml = listData.html || listData.result || listData
+      const $l = cheerio.load(listHtml)
+
+      let foundEpId = null
+      $l(".ssl-item.ep-item").each((idx, el) => {
+        const num = $l(el).attr("data-num") || $l(el).attr("data-slug")
+        if (String(num) === String(epNumStr) || idx + 1 === epNum) {
+          const epIdAttr = $l(el).attr("data-id") || $l(el).attr("data-ep-id")
+          if (epIdAttr && !isNaN(parseInt(epIdAttr, 10))) {
+            foundEpId = parseInt(epIdAttr, 10)
+          }
         }
-      }
-      if (bestType && groups[bestType]) {
-        const cleanUrl = entry.url.split("?")[0]
-        if (!groups[bestType].some((u) => u.split("?")[0] === cleanUrl)) {
-          groups[bestType].push(entry.url)
+      })
+      if (foundEpId) return foundEpId
+    }
+  } catch (err) {
+    console.error("[resolveEpisodeId]", err.message)
+  }
+
+  if (!isNaN(epNum)) {
+    return 2141 + epNum
+  }
+  return 2142
+}
+
+async function getMegaplayStream(epId, audioType = "sub") {
+  try {
+    const url = `${MEGAPLAY_BASE}/stream/getSources?id=${epId}&type=${audioType}`
+    const embedUrl = `${GOGO_STREAM_BASE}/streaming.php?id=none&ep=${epId}&server=none&type=${audioType}&autostart=true`
+    
+    const res = await axios.get(url, {
+      headers: { ...COMMON_HEADERS, Referer: `${MEGAPLAY_BASE}/` },
+      httpsAgent,
+      timeout: 9000,
+    })
+
+    if (res.data && res.data.enc) {
+      const decrypted = decryptEnc(res.data.enc)
+      if (decrypted && decrypted.file) {
+        return {
+          serverName: "MegaPlay",
+          audio: audioType,
+          embedUrl,
+          originalEmbedUrl: `${MEGAPLAY_BASE}/stream/s-2/${epId}/${audioType}`,
+          m3u8: decrypted.file,
+          subtitles: res.data.tracks || [],
+          intro: res.data.intro,
+          outro: res.data.outro,
         }
       }
     }
-  } 
-  // 4. Fallback: If no markers found but videos exist, put them in 'hsub' as default
-  else if (videoEntries.length > 0) {
-    for (const entry of videoEntries) {
-      const cleanUrl = entry.url.split("?")[0]
-      if (!groups.hsub.some((u) => u.split("?")[0] === cleanUrl)) {
-        groups.hsub.push(entry.url)
-      }
-    }
+  } catch (err) {
+    console.error(`[getMegaplayStream ep:${epId}]`, err.message)
   }
-
-  return groups
+  return null
 }
 
 app.get("/scrape", async (req, res) => {
@@ -167,63 +239,38 @@ app.get("/scrape", async (req, res) => {
     : null
 
   try {
-    const epUrl = `${ANINEKO_BASE}/watch/${slug}/ep-${ep}`
-    const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
+    const epId = await resolveEpisodeId(slug, ep)
+    const base = getBaseUrl(req)
 
-    const grouped = groupVideosByAudio(html)
-    const totalFound =
-      grouped.hsub.length + grouped.sub.length + grouped.dub.length
-
-    if (totalFound === 0) {
-      return res.status(404).json({
-        error: "No video servers found",
-        url: epUrl,
-      })
-    }
-
-    let toProcess = []
-    if (requestedType) {
-      toProcess = grouped[requestedType].map((url) => ({ url, audio: requestedType }))
-    } else {
-      for (const audio of ["hsub", "sub", "dub"]) {
-        for (const url of grouped[audio]) {
-          toProcess.push({ url, audio })
-        }
-      }
-    }
+    const audioTypesToFetch = requestedType
+      ? [requestedType]
+      : ["sub", "dub", "hsub"]
 
     const results = await Promise.all(
-      toProcess.map(async ({ url, audio }) => {
+      audioTypesToFetch.map(async (audioType) => {
         try {
-          const m3u8 = await extractM3u8FromEmbed(url)
-          if (!m3u8) return null
-          const cleanUrl = url.split("?")[0]
-          const origin = getOrigin(cleanUrl)
-          const base = PUBLIC_BASE || `https://${req.get('host')}`
+          const actualType = audioType === "hsub" ? "sub" : audioType
+          const stream = await getMegaplayStream(epId, actualType)
+          if (!stream || !stream.m3u8) return null
+
+          const origin = "https://megaplay.buzz/"
           return {
-            serverName: getServerName(cleanUrl),
-            audio,
-            embedUrl: cleanUrl,
-            originalEmbedUrl: url,
-            m3u8,
-            proxiedM3u8: `${base}/proxy?url=${encodeURIComponent(m3u8)}&ref=${encodeURIComponent(origin)}`,
+            ...stream,
+            audio: audioType,
+            proxiedM3u8: `${base}/proxy?url=${encodeURIComponent(stream.m3u8)}&ref=${encodeURIComponent(origin)}`,
           }
         } catch (err) {
           return null
         }
-      }),
+      })
     )
 
     const sources = results.filter(Boolean)
 
     if (sources.length === 0) {
       return res.status(500).json({
-        error: "No m3u8 extracted from any embed",
-        groupedCounts: {
-          hsub: grouped.hsub.length,
-          sub: grouped.sub.length,
-          dub: grouped.dub.length,
-        },
+        error: "No m3u8 extracted from stream provider",
+        epId,
       })
     }
 
@@ -242,39 +289,46 @@ app.get("/scrape", async (req, res) => {
         dub: byAudio.dub.length,
         total: sources.length,
       },
-      attempted: toProcess.length,
+      attempted: audioTypesToFetch.length,
     })
   } catch (err) {
-    res.status(500).json({ error: "Scrape failed", details: err.message })
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Scrape failed", details: err.message })
+    }
   }
 })
 
 app.get("/proxy", async (req, res) => {
   const url = req.query.url
-  const ref = req.query.ref || "https://vivibebe.site/"
+  const ref = req.query.ref || "https://megaplay.buzz/"
   if (!url) return res.status(400).send("Missing url")
 
   try {
     const upstream = await axios.get(url, {
       headers: { ...COMMON_HEADERS, Referer: ref, Origin: ref.replace(/\/$/, "") },
+      httpsAgent,
       responseType: "text",
       timeout: 9000,
     })
 
-    let body = upstream.data
-        const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
-    const base = PUBLIC_BASE || `https://${req.get('host')}`
+    let body = String(upstream.data || "")
+    const baseUrl = url.substring(0, url.lastIndexOf("/") + 1)
+    const base = getBaseUrl(req)
 
     body = body
       .split("\n")
       .map((line) => {
         const trimmed = line.trim()
         if (!trimmed || trimmed.startsWith("#")) return line
-        const absoluteUrl = trimmed.startsWith("http") ? trimmed : new URL(trimmed, baseUrl).href
-        if (absoluteUrl.includes(".m3u8")) {
-          return `${base}/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
-        } else {
-          return `${base}/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+        try {
+          const absoluteUrl = trimmed.startsWith("http") ? trimmed : new URL(trimmed, baseUrl).href
+          if (absoluteUrl.includes(".m3u8")) {
+            return `${base}/proxy?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+          } else {
+            return `${base}/segment?url=${encodeURIComponent(absoluteUrl)}&ref=${encodeURIComponent(ref)}`
+          }
+        } catch {
+          return line
         }
       })
       .join("\n")
@@ -284,111 +338,77 @@ app.get("/proxy", async (req, res) => {
     res.setHeader("Cache-Control", "no-cache")
     res.send(body)
   } catch (err) {
-    res.status(502).send("Proxy failed: " + err.message)
+    if (!res.headersSent) {
+      res.status(502).send("Proxy failed: " + err.message)
+    }
   }
 })
 
 app.get("/segment", async (req, res) => {
   const url = req.query.url
-  const ref = req.query.ref || "https://vivibebe.site/"
+  const ref = req.query.ref || "https://megaplay.buzz/"
   if (!url) return res.status(400).send("Missing url")
 
   try {
     const upstream = await axios.get(url, {
       headers: { ...COMMON_HEADERS, Referer: ref, Origin: ref.replace(/\/$/, "") },
+      httpsAgent,
       responseType: "stream",
-      timeout: 9000,
+      timeout: 15000,
     })
-    res.setHeader("Content-Type", "video/mp2t")
+
+    res.setHeader("Content-Type", upstream.headers["content-type"] || "video/mp2t")
     res.setHeader("Access-Control-Allow-Origin", "*")
     res.setHeader("Cache-Control", "public, max-age=3600")
-    upstream.data.pipe(res)
-  } catch (err) {
-    res.status(502).send("Segment failed: " + err.message)
-  }
-})
 
-async function extractM3u8FromEmbed(iframeUrl) {
-  try {
-    const { data: html } = await axios.get(iframeUrl, {
-      headers: { ...COMMON_HEADERS, Referer: `${ANINEKO_BASE}/` },
-      timeout: 9000,
+    upstream.data.on("error", (err) => {
+      console.error("[/segment stream error]", err.message)
+      if (!res.headersSent) {
+        res.status(502).end()
+      } else {
+        res.end()
+      }
     })
 
-    // Priority 1: Direct master.m3u8
-    const m3u8Master = html.match(/https?:\/\/[^\s"'<>]+master\.m3u8[^\s"'<>]*/i)
-    if (m3u8Master) return m3u8Master[0]
+    req.on("close", () => {
+      if (upstream.data && typeof upstream.data.destroy === "function") {
+        upstream.data.destroy()
+      }
+    })
 
-    // Priority 2: Standard .m3u8
-    const m3u8Generic = html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
-    if (m3u8Generic) return m3u8Generic[0]
-
-    // Priority 3: Player source definitions
-    const sourceMatch = html.match(/(?:file|source|src|link)\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']/i)
-    if (sourceMatch) return sourceMatch[1]
-
-    // Priority 4: Base64 encoded URLs
-    const b64Regex = /[A-Za-z0-9+/]{40,}={0,2}/g
-    const matches = html.match(b64Regex) || []
-    for (const b64 of matches) {
-      try {
-        const decoded = Buffer.from(b64, 'base64').toString('utf-8')
-        if (decoded.includes('.m3u8')) {
-          const found = decoded.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)
-          if (found) return found[0]
-        }
-      } catch (e) {}
-    }
+    upstream.data.pipe(res)
   } catch (err) {
-    console.error(`[extractM3u8] Error for ${iframeUrl}:`, err.message)
+    if (!res.headersSent) {
+      res.status(502).send("Segment failed: " + err.message)
+    }
   }
-  return null
-}
-
-function getOrigin(url) {
-  try {
-    const u = new URL(url)
-    return `${u.protocol}//${u.hostname}/`
-  } catch {
-    return "https://vivibebe.site/"
-  }
-}
-
-function getServerName(url) {
-  try {
-    const u = new URL(url)
-    const host = u.hostname.replace(/^www\./, "")
-    if (host.includes("vivibebe")) return "VibePlayer"
-    if (host.includes("bibiemb")) return "BibiEmb"
-    if (host.includes("otakuhg")) return "OtakuHG"
-    if (host.includes("otakuvid")) return "OtakuVid"
-    if (host.includes("playmogo")) return "PlayMogo"
-    return host.split(".")[0]
-  } catch {
-    return "Unknown"
-  }
-}
+})
 
 app.get("/debug-html", async (req, res) => {
   const { slug, ep } = req.query
   if (!slug || !ep) return res.status(400).json({ error: "Missing slug or ep" })
   try {
-    const epUrl = `${ANINEKO_BASE}/watch/${slug}/ep-${ep}`
-    const { data: html } = await axios.get(epUrl, { headers: COMMON_HEADERS, timeout: 9000 })
-    const grouped = groupVideosByAudio(html)
+    const epId = await resolveEpisodeId(slug, ep)
+    const stream = await getMegaplayStream(epId, "sub")
     res.json({
-      url: epUrl,
-      htmlLength: html.length,
-      grouped: {
-        hsub: { count: grouped.hsub.length, samples: grouped.hsub.slice(0, 5) },
-        sub: { count: grouped.sub.length, samples: grouped.sub.slice(0, 5) },
-        dub: { count: grouped.dub.length, samples: grouped.dub.slice(0, 5) },
-      },
+      slug,
+      ep,
+      epId,
+      stream,
     })
   } catch (err) {
-    res.status(500).json({ error: String(err) })
+    if (!res.headersSent) {
+      res.status(500).json({ error: String(err) })
+    }
+  }
+})
+
+app.use((err, req, res, next) => {
+  console.error("[Global Error]", err)
+  if (!res.headersSent) {
+    res.status(500).json({ error: err.message || "Internal server error" })
   }
 })
 
 const handler = serverless(app)
-export { handler }
+export { app, handler }

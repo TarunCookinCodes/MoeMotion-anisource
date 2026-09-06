@@ -1,34 +1,21 @@
+import { app } from "./functions/api.js";
 import axios from "axios";
-import * as cheerio from "cheerio";
-
-const ANINEKO_BASE = "https://anineko.to";
-const COMMON_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-};
 
 async function testSearch(query) {
-  try {
-    const url = `${ANINEKO_BASE}/browser?keyword=${encodeURIComponent(query)}`;
-    console.log("Searching:", url);
-    const { data: html } = await axios.get(url, { headers: COMMON_HEADERS });
-    const $ = cheerio.load(html);
-    const results = [];
-    
-    $("a[href*='/watch/']").each((_, el) => {
-      const $el = $(el);
-      const href = $el.attr("href") || "";
-      const match = href.match(/\/watch\/([^/?#]+)/);
-      if (!match) return;
-      const slug = match[1];
-      const title = $el.find(".name, .title, h3, h4").text().trim() || $el.text().trim();
-      results.push({ slug, title });
-    });
-
-    console.log("Results found:", results.length);
-    console.log("First 3 results:", results.slice(0, 3));
-  } catch (err) {
-    console.error("Search failed:", err.message);
-  }
+  const server = app.listen(0, async () => {
+    const port = server.address().port;
+    try {
+      console.log(`Testing /search for query: "${query}"`);
+      const res = await axios.get(`http://localhost:${port}/search?q=${encodeURIComponent(query)}`);
+      console.log("Search status:", res.status);
+      console.log("Results count:", res.data.results.length);
+      console.log("First 3 results:", res.data.results.slice(0, 3));
+    } catch (err) {
+      console.error("Search failed:", err.response?.data || err.message);
+    } finally {
+      server.close();
+    }
+  });
 }
 
 testSearch("one piece");

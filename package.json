@@ -1,11 +1,12 @@
 {
-  "name": "anineko-scraper",
+  "name": "hianime-scraper",
   "version": "1.0.0",
-  "description": "AniNeko scraper for MoeMotion",
+  "description": "HiAnime scraper for MoeMotion",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "dependencies": {
     "axios": "^1.7.7",
