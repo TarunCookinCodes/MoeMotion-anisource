@@ -353,30 +353,14 @@ app.get("/segment", async (req, res) => {
     const upstream = await axios.get(url, {
       headers: { ...COMMON_HEADERS, Referer: ref, Origin: ref.replace(/\/$/, "") },
       httpsAgent,
-      responseType: "stream",
+      responseType: "arraybuffer",
       timeout: 15000,
     })
 
-    res.setHeader("Content-Type", upstream.headers["content-type"] || "video/mp2t")
+    res.setHeader("Content-Type", "video/mp2t")
     res.setHeader("Access-Control-Allow-Origin", "*")
     res.setHeader("Cache-Control", "public, max-age=3600")
-
-    upstream.data.on("error", (err) => {
-      console.error("[/segment stream error]", err.message)
-      if (!res.headersSent) {
-        res.status(502).end()
-      } else {
-        res.end()
-      }
-    })
-
-    req.on("close", () => {
-      if (upstream.data && typeof upstream.data.destroy === "function") {
-        upstream.data.destroy()
-      }
-    })
-
-    upstream.data.pipe(res)
+    res.send(Buffer.from(upstream.data))
   } catch (err) {
     if (!res.headersSent) {
       res.status(502).send("Segment failed: " + err.message)
@@ -410,5 +394,7 @@ app.use((err, req, res, next) => {
   }
 })
 
-const handler = serverless(app)
+const handler = serverless(app, {
+  binary: ["*/*", "video/*", "image/*", "application/octet-stream", "video/mp2t"],
+})
 export { app, handler }
